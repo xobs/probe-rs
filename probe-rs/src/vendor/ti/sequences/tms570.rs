@@ -14,12 +14,12 @@ use super::icepick::Icepick;
 
 /// Marker struct indicating initialization sequencing for cc13xx_cc26xx family parts.
 #[derive(Debug)]
-pub struct CC13xxCC26xx {
+pub struct TMS570 {
     // Chip name
     name: String,
 }
 
-impl CC13xxCC26xx {
+impl TMS570 {
     /// Create the sequencer for the cc13xx_cc26xx family of parts.
     pub fn create(name: String) -> Arc<Self> {
         Arc::new(Self { name })
@@ -58,13 +58,14 @@ fn reset_chip(chip: &str, probe: &mut dyn ArmMemoryInterface) {
     }
 }
 
-impl ArmDebugSequence for CC13xxCC26xx {
+impl ArmDebugSequence for TMS570 {
     fn reset_system(
         &self,
         probe: &mut dyn ArmMemoryInterface,
         core_type: probe_rs_target::CoreType,
         debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
+        println!("Resetting system...");
         // Check if the previous code requested a halt before reset
         let demcr = Demcr(probe.read_word_32(Demcr::get_mmio_address())?);
 
@@ -109,7 +110,6 @@ impl ArmDebugSequence for CC13xxCC26xx {
         match interface.active_protocol() {
             Some(WireProtocol::Jtag) => {
                 let mut icepick = Icepick::new(interface)?;
-                icepick.ctag_to_jtag()?;
                 icepick.select_tap(0)?;
 
                 // Call the configure JTAG function. We don't derive the scan chain at runtime
@@ -121,7 +121,7 @@ impl ArmDebugSequence for CC13xxCC26xx {
             }
             Some(WireProtocol::Swd) => {
                 return Err(ArmDebugSequenceError::SequenceSpecific(
-                    "The cc13xx_cc26xx family doesn't support SWD".into(),
+                    "The tms570 family doesn't support SWD".into(),
                 )
                 .into());
             }
