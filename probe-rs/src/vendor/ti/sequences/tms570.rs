@@ -1,9 +1,6 @@
-//! Sequences for cc13xx_cc26xx devices
+//! Sequences for tms570 devices
 use std::sync::Arc;
-use std::time::Duration;
 
-use crate::MemoryMappedRegister;
-use crate::architecture::arm::armv7m::{Demcr, Dhcsr};
 use crate::architecture::arm::communication_interface::DapProbe;
 use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{ArmDebugSequence, ArmDebugSequenceError};
@@ -14,88 +11,37 @@ use super::icepick::Icepick;
 
 /// Marker struct indicating initialization sequencing for cc13xx_cc26xx family parts.
 #[derive(Debug)]
-pub struct TMS570 {
-    // Chip name
-    name: String,
-}
+pub struct TMS570 {}
 
 impl TMS570 {
     /// Create the sequencer for the cc13xx_cc26xx family of parts.
-    pub fn create(name: String) -> Arc<Self> {
-        Arc::new(Self { name })
-    }
-}
-
-/// Do a full system reset (emulated PIN reset)
-///
-/// CPU reset alone is not possible since AIRCR.SYSRESETREQ will be
-/// converted to system reset on these devices.
-///
-/// The below code writes to the following bit
-/// `AON_PMCTL.RESETCTL.SYSRESET=1`d or its equivalent based on family
-fn reset_chip(chip: &str, probe: &mut dyn ArmMemoryInterface) {
-    // The CC family of device have a pattern where the 6th character of the device name dictates the family
-    // Use this to determine the correct address to write to
-    match chip.chars().nth(5).unwrap() {
-        // Note that errors are ignored
-        // writing this register will immediately trigger a system reset which causes us to lose the debug interface
-        // We also don't need to worry about preserving register state because we will anyway reset.
-        '0' => {
-            probe.write_word_32(0x4009_0004, 0x8000_0000).ok();
-        }
-        '1' | '2' => {
-            probe.write_word_32(0x4009_0028, 0x8000_0000).ok();
-        }
-        '4' => {
-            probe.write_word_32(0x5809_0028, 0x8000_0000).ok();
-        }
-        _ => {
-            unreachable!(
-                "TI CC13xx/CC26xx debug sequence used on an unsupported chip: {chip}",
-                chip = chip
-            );
-        }
+    pub fn create(_name: String) -> Arc<Self> {
+        Arc::new(Self {})
     }
 }
 
 impl ArmDebugSequence for TMS570 {
+    fn reset_hardware_assert(&self, _interface: &mut dyn DapProbe) -> Result<(), ArmError> {
+        tracing::trace!("Ignoring hardware reset assert!");
+        Ok(())
+    }
+
+    fn reset_hardware_deassert(
+        &self,
+        _probe: &mut dyn crate::architecture::arm::ArmProbeInterface,
+        _default_ap: &crate::architecture::arm::FullyQualifiedApAddress,
+    ) -> Result<(), ArmError> {
+        tracing::trace!("Ignoring hardware reset deassert!");
+        Ok(())
+    }
+
     fn reset_system(
         &self,
-        probe: &mut dyn ArmMemoryInterface,
-        core_type: probe_rs_target::CoreType,
-        debug_base: Option<u64>,
+        _probe: &mut dyn ArmMemoryInterface,
+        _core_type: probe_rs_target::CoreType,
+        _debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        println!("Resetting system...");
-        // Check if the previous code requested a halt before reset
-        let demcr = Demcr(probe.read_word_32(Demcr::get_mmio_address())?);
-
-        // Do target specific reset
-        reset_chip(&self.name, probe);
-
-        // Since the system went down, including the debug, we should flush any pending operations
-        probe.flush().ok();
-
-        // Wait for the system to reset
-        std::thread::sleep(Duration::from_millis(1));
-
-        // Re-initializing the core(s) is on us.
-        let ap = probe.fully_qualified_address();
-        let interface = probe.get_arm_probe_interface()?;
-        interface.reinitialize()?;
-
-        assert!(debug_base.is_none());
-        self.debug_core_start(interface, &ap, core_type, None, None)?;
-
-        if demcr.vc_corereset() {
-            // TODO! Find a way to call the armv7m::halt function instead
-            let mut value = Dhcsr(0);
-            value.set_c_halt(true);
-            value.set_c_debugen(true);
-            value.enable_write();
-
-            probe.write_word_32(Dhcsr::get_mmio_address(), value.into())?;
-        }
-
+        tracing::trace!("System was reset (except not really...)");
         Ok(())
     }
 
@@ -104,6 +50,7 @@ impl ArmDebugSequence for TMS570 {
         interface: &mut dyn DapProbe,
         _dp: DpAddress,
     ) -> Result<(), ArmError> {
+        tracing::trace!("Configuring TMS570...");
         // Ensure current debug interface is in reset state.
         interface.swj_sequence(51, 0x0007_FFFF_FFFF_FFFF)?;
 
@@ -133,6 +80,7 @@ impl ArmDebugSequence for TMS570 {
             }
         }
 
+        tracing::info!("TMS570 configured");
         Ok(())
     }
 }

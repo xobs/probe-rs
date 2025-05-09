@@ -372,6 +372,9 @@ impl Registry {
     /// Add a target family to the registry from a YAML-formatted string.
     pub fn add_target_family_from_yaml(&mut self, yaml: &str) -> Result<String, RegistryError> {
         let family: ChipFamily = serde_yaml::from_str(yaml)?;
+        if let Some(alg) = family.algorithms().get(0) {
+            assert!(alg.stack_size.is_some(), "Stack size is None");
+        }
         self.add_target_family(family)
     }
 }

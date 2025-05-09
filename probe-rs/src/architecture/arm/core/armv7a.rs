@@ -3,19 +3,18 @@
 use super::{
     CortexAState,
     instructions::aarch32::{
-        build_bx, build_ldc, build_mcr, build_mov, build_mrc, build_mrs, build_stc, build_vmov,
-        build_vmrs,
+        build_ldc, build_mcr, build_mov, build_mrc, build_mrs, build_stc, build_vmov, build_vmrs,
     },
     registers::{
         aarch32::{
             AARCH32_CORE_REGISTERS, AARCH32_WITH_FP_16_CORE_REGISTERS,
             AARCH32_WITH_FP_32_CORE_REGISTERS,
         },
-        cortex_m::{FP, PC, RA, SP},
+        cortex_m::{FP, PC, RA, SP, XPSR},
     },
 };
 use crate::{
-    Architecture, CoreInformation, CoreInterface, CoreRegister, CoreStatus, CoreType,
+    Architecture, CoreInformation, CoreInterface, CoreRegister, CoreStatus, CoreType, Endian,
     InstructionSet, MemoryInterface,
     architecture::arm::{
         ArmError, core::armv7a_debug_regs::*, memory::ArmMemoryInterface,
@@ -34,7 +33,7 @@ use std::{
 /// Errors for the ARMv7-A state machine
 #[derive(thiserror::Error, Debug)]
 pub enum Armv7aError {
-    /// Invalid register number
+    /// Invalid register number {0}
     #[error("Register number {0} is not valid for ARMv7-A")]
     InvalidRegisterNumber(u16),
 
@@ -237,9 +236,15 @@ impl<'probe> Armv7a<'probe> {
 
                             self.execute_instruction_with_input(instruction, val.try_into()?)?;
 
-                            // BX r0
-                            let instruction = build_bx(0);
+                            // mov pc, r0
+                            let instruction = build_mov(15, 0);
                             self.execute_instruction(instruction)?;
+                        }
+                        16 => {
+                            // msr cpsr_fsxc, r0
+                            let instruction = 0xe12ff000;
+
+                            self.execute_instruction_with_input(instruction, val.try_into()?)?;
                         }
                         17..=48 => {
                             // Move value to r0, r1
@@ -391,8 +396,41 @@ impl CoreInterface for Armv7a<'_> {
     }
     fn run(&mut self) -> Result<(), Error> {
         if matches!(self.state.current_state, CoreStatus::Running) {
+            tracing::trace!("Core already running -- skipping restore");
             return Ok(());
         }
+
+        // // If the program counter has changed, ensure we return to the correct processor state
+        // if let Some((pc, true)) = self.state.register_cache[self.program_counter().id.0 as usize] {
+        //     // Convert `pc` into a `u128`, since that is infallible.
+        //     let pc: u128 = pc.try_into().unwrap();
+        //     let wanted_mode = if pc & 1 == 1 {
+        //         InstructionSet::Thumb2
+        //     } else {
+        //         InstructionSet::A32
+        //     };
+        //     let cpsr = TryInto::<u32>::try_into(self.read_core_reg(XPSR.id())?).unwrap();
+        //     tracing::trace!("Updating PC. Existing CPSR: 0x{:08x}", cpsr);
+        //     if wanted_mode != self.instruction_set()? {
+        //         let mut cpsr =
+        //             TryInto::<u32>::try_into(self.read_core_reg(XPSR.id())?).unwrap() & !(1 << 5);
+        //         if wanted_mode == InstructionSet::Thumb2 {
+        //             cpsr |= 1 << 5;
+        //         }
+        //         tracing::trace!(
+        //             "Updating run mode to {:?} with CPSR: 0x{:08x}",
+        //             wanted_mode,
+        //             cpsr
+        //         );
+        //         self.write_core_reg(XPSR.id(), RegisterValue::U32(cpsr))?;
+        //     } else {
+        //         tracing::trace!(
+        //             "We're updating PC to 0x{:08x}, but the core was already in {:?} mode",
+        //             pc,
+        //             wanted_mode
+        //         );
+        //     }
+        // }
 
         // set writeback values
         self.writeback_registers()?;
@@ -777,12 +815,21 @@ impl CoreInterface for Armv7a<'_> {
     }
 
     fn instruction_set(&mut self) -> Result<InstructionSet, Error> {
-        let cpsr: u32 = self.read_core_reg(RegisterId(16))?.try_into()?;
+        let cpsr: u32 = self.read_core_reg(XPSR.id())?.try_into()?;
 
         // CPSR bit 5 - T - Thumb mode
         match (cpsr >> 5) & 1 {
             1 => Ok(InstructionSet::Thumb2),
             _ => Ok(InstructionSet::A32),
+        }
+    }
+
+    fn endianness(&mut self) -> Result<Endian, Error> {
+        let psr = TryInto::<u32>::try_into(self.read_core_reg(XPSR.id())?).unwrap();
+        if psr & 1 << 9 == 0 {
+            Ok(Endian::Little)
+        } else {
+            Ok(Endian::Big)
         }
     }
 
@@ -796,24 +843,28 @@ impl CoreInterface for Armv7a<'_> {
 
     #[tracing::instrument(skip(self))]
     fn reset_catch_set(&mut self) -> Result<(), Error> {
-        self.sequence.reset_catch_set(
-            &mut *self.memory,
-            CoreType::Armv7a,
-            Some(self.base_address),
-        )?;
-
+        self.halted_access(|core| {
+            core.sequence.reset_catch_set(
+                &mut *core.memory,
+                CoreType::Armv7a,
+                Some(core.base_address),
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
     fn reset_catch_clear(&mut self) -> Result<(), Error> {
         // Clear the reset_catch bit which was set earlier.
-        self.sequence.reset_catch_clear(
-            &mut *self.memory,
-            CoreType::Armv7a,
-            Some(self.base_address),
-        )?;
-
+        self.halted_access(|core| {
+            core.sequence.reset_catch_clear(
+                &mut *core.memory,
+                CoreType::Armv7a,
+                Some(core.base_address),
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -860,7 +911,13 @@ impl MemoryInterface for Armv7a<'_> {
             core.set_r0(address)?;
 
             // Read memory from [r0]
-            core.execute_instruction_with_result(instr)
+            let data = core.execute_instruction_with_result(instr)?;
+            let data = match core.endianness()? {
+                Endian::Little => u32::from_le(data),
+                Endian::Big => u32::from_be(data),
+            };
+            tracing::trace!("Reading [0x{:08x}] = 0x{:08x}", address, data);
+            Ok(data)
         })
     }
 
@@ -949,13 +1006,19 @@ impl MemoryInterface for Armv7a<'_> {
             // STC p14, c5, [r0], #4
             let instr = build_stc(14, 5, 0, 4);
 
+            // Write to [r0]
+            let data = match core.endianness()? {
+                Endian::Little => data.to_le(),
+                Endian::Big => data.to_be(),
+            };
+
             // Save r0
             core.prepare_r0_for_clobber()?;
 
             // Load r0 with the address to write to
             core.set_r0(address)?;
 
-            // Write to [r0]
+            tracing::trace!("Setting [0x{:08x}] = 0x{:08x}", address, data);
             core.execute_instruction_with_input(instr, data)
         })
     }
@@ -971,6 +1034,11 @@ impl MemoryInterface for Armv7a<'_> {
             let mut word_bytes = current_word.to_le_bytes();
             word_bytes[byte_offset as usize] = data;
 
+            tracing::trace!(
+                "Setting [0x{:08x}] = 0x{:08x}",
+                word_start,
+                u32::from_le_bytes(word_bytes)
+            );
             core.write_word_32(word_start, u32::from_le_bytes(word_bytes))
         })
     }
@@ -988,6 +1056,7 @@ impl MemoryInterface for Armv7a<'_> {
             word &= !(0xFFFFu32 << (byte_offset * 8));
             word |= (data as u32) << (byte_offset * 8);
 
+            tracing::trace!("Setting [0x{:08x}] = 0x{:08x}", word_start, word);
             core.write_word_32(word_start, word)
         })
     }
@@ -1679,13 +1748,13 @@ mod test {
         // First read will hit expectations
         assert_eq!(
             RegisterValue::from(REG_VALUE),
-            armv7a.read_core_reg(RegisterId(16)).unwrap()
+            armv7a.read_core_reg(XPSR.id()).unwrap()
         );
 
         // Second read will cache, no new expectations
         assert_eq!(
             RegisterValue::from(REG_VALUE),
-            armv7a.read_core_reg(RegisterId(16)).unwrap()
+            armv7a.read_core_reg(XPSR.id()).unwrap()
         );
     }
 

@@ -120,7 +120,7 @@ pub enum ArmError {
     /// ARMv8a specific error occurred.
     Armv8a(#[from] Armv8aError),
 
-    /// ARMv7a specific error occurred.
+    /// ARMv7a specific error occurred: {0}
     Armv7a(#[from] Armv7aError),
 
     /// Error occurred in a debug sequence.

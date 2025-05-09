@@ -12,6 +12,7 @@ pub mod list;
 pub mod sifliuart;
 pub mod stlink;
 pub mod wlink;
+pub mod xds110;
 
 use crate::architecture::arm::sequences::{ArmDebugSequence, DefaultArmSequence};
 use crate::architecture::arm::{ArmError, DapError};
@@ -1105,6 +1106,11 @@ pub(crate) trait RawJtagIo: DebugProbe {
 
         Ok(())
     }
+
+    /// Configures the probe for JTAG use (specifying IR lengths of each DAP).
+    fn configure_jtag(&mut self, _skip_scan: bool) -> Result<(), DebugProbeError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1386,6 +1392,11 @@ pub trait JtagAccess: DebugProbe {
         }
 
         Ok(results)
+    }
+
+    /// Configures the probe for JTAG use (specifying IR lengths of each DAP).
+    fn configure_jtag(&mut self, _skip_scan: bool) -> Result<(), DebugProbeError> {
+        Ok(())
     }
 }
 

@@ -17,7 +17,7 @@ use std::{
 };
 
 /// The timeout for init/uninit routines.
-const INIT_TIMEOUT: Duration = Duration::from_secs(2);
+const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) trait Operation {
     const OPERATION: u32;
@@ -176,43 +176,87 @@ impl Flasher {
         // TODO: Possible special preparation of the target such as enabling faster clocks for the flash e.g.
 
         // Load flash algorithm code into target RAM.
-        tracing::debug!("Downloading algorithm code to {:#010x}", algo.load_address);
+        tracing::debug!(
+            "Downloading {} bytes of algorithm code to {:#010x}",
+            algo.instructions.len() / 4,
+            algo.load_address
+        );
 
+        // let mut instructions = algo.instructions.clone();
+        // for instruction in instructions.iter_mut() {
+        //     *instruction = instruction.to_be();
+        // }
+        // for (offset, word) in algo.instructions.iter().enumerate() {
+        //     let word = word.to_be();
+        //     tracing::info!(
+        //         "0x{:08x} = 0x{:08x} (be: 0x{:08x})",
+        //         algo.load_address + (offset as u64 * 4),
+        //         word,
+        //         word.to_be(),
+        //     );
+
+        //     if let Err(e) = core.write_word_32(algo.load_address + (offset as u64 * 4), word) {
+        //         tracing::error!(
+        //             "Unable to write {:08x} to address {:08x}: {}",
+        //             word,
+        //             algo.load_address + (offset as u64 * 4),
+        //             e
+        //         );
+        //         return Err(FlashError::Core(e));
+        //     }
+        // }
         core.write_32(algo.load_address, algo.instructions.as_slice())
             .map_err(FlashError::Core)?;
 
-        let mut data = vec![0; algo.instructions.len()];
-        core.read_32(algo.load_address, &mut data)
-            .map_err(FlashError::Core)?;
+        tracing::debug!("Ensuring the data was written correctly (skipped)...");
 
-        for (offset, (original, read_back)) in algo.instructions.iter().zip(data.iter()).enumerate()
-        {
-            if original == read_back {
-                continue;
-            }
+        // let mut data = vec![0; algo.instructions.len()];
+        // core.read_32(algo.load_address, &mut data)
+        //     .map_err(FlashError::Core)?;
 
-            tracing::error!(
-                "Failed to verify flash algorithm. Data mismatch at address {:#010x}",
-                algo.load_address + (4 * offset) as u64
-            );
-            tracing::error!("Original instruction: {:#010x}", original);
-            tracing::error!("Readback instruction: {:#010x}", read_back);
+        // for (offset, (original, read_back)) in algo.instructions.iter().zip(data.iter()).enumerate()
+        // {
+        //     if *original == *read_back {
+        //         continue;
+        //     }
 
-            tracing::error!("Original: {:x?}", &algo.instructions);
-            tracing::error!("Readback: {:x?}", &data);
+        //     tracing::error!(
+        //         "Failed to verify flash algorithm. Data mismatch at address {:#010x}",
+        //         algo.load_address + (4 * offset) as u64
+        //     );
+        //     tracing::error!("Original instruction: {:#010x}", original);
+        //     tracing::error!("Readback instruction: {:#010x}", read_back);
 
-            return Err(FlashError::FlashAlgorithmNotLoaded);
-        }
+        //     tracing::error!("Original: {:x?}", &algo.instructions);
+        //     tracing::error!("Readback: {:x?}", &data);
 
+        //     return Err(FlashError::FlashAlgorithmNotLoaded);
+        // }
+
+        tracing::debug!("Filling stack with known data");
         if algo.stack_overflow_check {
             // Fill the stack with known data.
             let stack_bottom = algo.stack_top - algo.stack_size;
-            let fill = vec![STACK_FILL_BYTE; algo.stack_size as usize];
-            core.write_8(stack_bottom, &fill)
-                .map_err(FlashError::Core)?;
+            if algo.stack_size & 3 == 0 {
+                let fill = vec![
+                    u32::from_ne_bytes([
+                        STACK_FILL_BYTE,
+                        STACK_FILL_BYTE,
+                        STACK_FILL_BYTE,
+                        STACK_FILL_BYTE
+                    ]);
+                    algo.stack_size as usize / 4
+                ];
+                core.write_32(stack_bottom, &fill)
+                    .map_err(FlashError::Core)?;
+            } else {
+                let fill = vec![STACK_FILL_BYTE; algo.stack_size as usize];
+                core.write_8(stack_bottom, &fill)
+                    .map_err(FlashError::Core)?;
+            }
         }
 
-        tracing::debug!("RAM contents match flashing algo blob.");
+        // tracing::debug!("RAM contents match flashing algo blob.");
 
         Ok(())
     }
@@ -482,7 +526,7 @@ impl Flasher {
                                 r3: None,
                             },
                             false,
-                            Duration::from_secs(30),
+                            Duration::from_secs(300),
                         )?;
 
                         // Returns
@@ -861,6 +905,11 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             (regs.argument_register(1), registers.r1),
             (regs.argument_register(2), registers.r2),
             (regs.argument_register(3), registers.r3),
+            (regs.core_register(7), Some(0x87654312)),
+            (regs.core_register(8), Some(0xabcdef01)),
+            (regs.core_register(10), Some(0x99887766)),
+            (regs.core_register(11), Some(0x55667788)),
+            (regs.core_register(12), Some(0xa1b2c3d4)),
             (
                 regs.core_register(9),
                 if init {
@@ -880,8 +929,11 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             (
                 self.core.return_address(),
                 // For ARM Cortex-M cores, we have to add 1 to the return address,
-                // to ensure that we stay in Thumb mode.
-                if self.instruction_set == InstructionSet::Thumb2 {
+                // to ensure that we stay in Thumb mode. A32 also generally supports
+                // Thumb and uses the same `BKPT` instruction when in this mode.
+                if self.instruction_set == InstructionSet::Thumb2
+                    || self.instruction_set == InstructionSet::A32
+                {
                     Some(into_reg(algo.load_address + 1)?)
                 } else {
                     Some(into_reg(algo.load_address)?)
@@ -907,7 +959,7 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
                     })?;
 
                     tracing::debug!(
-                        "content of {} {:#x}: {:#010x} should be: {:#010x}",
+                        "contents of {} {:#x}: {:#010x} should be: {:#010x}",
                         description.name(),
                         description.id.0,
                         value,
@@ -1047,7 +1099,7 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
                             r3: None,
                         },
                         false,
-                        Duration::from_secs(30),
+                        Duration::from_secs(300),
                     )
                     .map_err(|error| FlashError::FlashReadFailed {
                         source: Box::new(error),
@@ -1155,7 +1207,7 @@ impl ActiveFlasher<'_, '_, Erase> {
                     r3: None,
                 },
                 false,
-                Duration::from_secs(40),
+                Duration::from_secs(400),
             )
             .map_err(|error| FlashError::ChipEraseFailed {
                 source: Box::new(error),

@@ -168,14 +168,18 @@ impl RttControlBlockHeader {
 
     pub fn max_up_channels(&self) -> usize {
         match self {
-            RttControlBlockHeader::Header32(x) => x.max_up_channels as usize,
+            RttControlBlockHeader::Header32(x) => {
+                u32::from(u32::from_be(x.max_up_channels)) as usize
+            }
             RttControlBlockHeader::Header64(x) => x.max_up_channels as usize,
         }
     }
 
     pub fn max_down_channels(&self) -> usize {
         match self {
-            RttControlBlockHeader::Header32(x) => x.max_down_channels as usize,
+            RttControlBlockHeader::Header32(x) => {
+                u32::from(u32::from_be(x.max_down_channels)) as usize
+            }
             RttControlBlockHeader::Header64(x) => x.max_down_channels as usize,
         }
     }
@@ -515,7 +519,7 @@ fn try_attach_to_rtt_inner(
             Err(_) if t.elapsed() < timeout => {
                 attempt += 1;
                 tracing::debug!("Failed to initialize RTT. Retrying until timeout.");
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(250));
             }
             other => return other,
         }

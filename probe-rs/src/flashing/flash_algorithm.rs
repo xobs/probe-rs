@@ -178,7 +178,7 @@ impl FlashAlgorithm {
     // Header for RISC-V Flash Algorithms
     const RISCV_FLASH_BLOB_HEADER: [u32; 2] = [riscv::assembly::EBREAK, riscv::assembly::EBREAK];
 
-    const ARM_FLASH_BLOB_HEADER: [u32; 1] = [arm::assembly::BRKPT];
+    const ARM_FLASH_BLOB_HEADER: [u32; 1] = [arm::assembly::BRKPT.to_be()];
 
     const XTENSA_FLASH_BLOB_HEADER: [u32; 0] = [];
 

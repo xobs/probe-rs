@@ -78,22 +78,24 @@ impl From<RttChannelBufferInner<u64>> for RttChannelBuffer {
 impl RttChannelBuffer {
     pub fn buffer_start_pointer(&self) -> u64 {
         match self {
-            RttChannelBuffer::Buffer32(x) => u64::from(x.buffer_start_pointer),
-            RttChannelBuffer::Buffer64(x) => x.buffer_start_pointer,
+            RttChannelBuffer::Buffer32(x) => u64::from(u32::from_be(x.buffer_start_pointer)),
+            RttChannelBuffer::Buffer64(x) => u64::from_be(x.buffer_start_pointer),
         }
     }
 
     pub fn standard_name_pointer(&self) -> Option<NonZeroU64> {
         match self {
-            RttChannelBuffer::Buffer32(x) => NonZeroU64::new(u64::from(x.standard_name_pointer)),
-            RttChannelBuffer::Buffer64(x) => NonZeroU64::new(x.standard_name_pointer),
+            RttChannelBuffer::Buffer32(x) => {
+                NonZeroU64::new(u64::from(u32::from_be(x.standard_name_pointer)))
+            }
+            RttChannelBuffer::Buffer64(x) => NonZeroU64::new(u64::from_be(x.standard_name_pointer)),
         }
     }
 
     pub fn size_of_buffer(&self) -> u64 {
         match self {
-            RttChannelBuffer::Buffer32(x) => u64::from(x.size_of_buffer),
-            RttChannelBuffer::Buffer64(x) => x.size_of_buffer,
+            RttChannelBuffer::Buffer32(x) => u64::from(u32::from_be(x.size_of_buffer)),
+            RttChannelBuffer::Buffer64(x) => u64::from_be(x.size_of_buffer),
         }
     }
 
@@ -103,12 +105,15 @@ impl RttChannelBuffer {
             RttChannelBuffer::Buffer32(h32) => {
                 let mut block = [0u32; 2];
                 core.read_32(ptr + h32.write_buffer_ptr_offset() as u64, block.as_mut())?;
-                (u64::from(block[0]), u64::from(block[1]))
+                (
+                    u64::from(u32::from_be(block[0])),
+                    u64::from(u32::from_be(block[1])),
+                )
             }
             RttChannelBuffer::Buffer64(h64) => {
                 let mut block = [0u64; 2];
                 core.read_64(ptr + h64.write_buffer_ptr_offset() as u64, block.as_mut())?;
-                (block[0], block[1])
+                (u64::from_be(block[0]), u64::from_be(block[1]))
             }
         })
     }
@@ -123,11 +128,14 @@ impl RttChannelBuffer {
             RttChannelBuffer::Buffer32(h32) => {
                 core.write_word_32(
                     ptr + h32.write_buffer_ptr_offset() as u64,
-                    buffer_ptr.try_into().unwrap(),
+                    TryInto::<u32>::try_into(buffer_ptr).unwrap().to_be(),
                 )?;
             }
             RttChannelBuffer::Buffer64(h64) => {
-                core.write_word_64(ptr + h64.write_buffer_ptr_offset() as u64, buffer_ptr)?;
+                core.write_word_64(
+                    ptr + h64.write_buffer_ptr_offset() as u64,
+                    buffer_ptr.to_be(),
+                )?;
             }
         };
         Ok(())
@@ -143,11 +151,14 @@ impl RttChannelBuffer {
             RttChannelBuffer::Buffer32(h32) => {
                 core.write_word_32(
                     ptr + h32.read_buffer_ptr_offset() as u64,
-                    buffer_ptr.try_into().unwrap(),
+                    TryInto::<u32>::try_into(buffer_ptr).unwrap().to_be(),
                 )?;
             }
             RttChannelBuffer::Buffer64(h64) => {
-                core.write_word_64(ptr + h64.read_buffer_ptr_offset() as u64, buffer_ptr)?;
+                core.write_word_64(
+                    ptr + h64.read_buffer_ptr_offset() as u64,
+                    buffer_ptr.to_be(),
+                )?;
             }
         };
         Ok(())
@@ -155,11 +166,11 @@ impl RttChannelBuffer {
 
     pub fn read_flags(&self, core: &mut Core, ptr: u64) -> Result<u64, Error> {
         Ok(match self {
-            RttChannelBuffer::Buffer32(h32) => {
-                u64::from(core.read_word_32(ptr + h32.flags_offset() as u64)?)
-            }
+            RttChannelBuffer::Buffer32(h32) => u64::from(u32::from_be(
+                core.read_word_32(ptr + h32.flags_offset() as u64)?,
+            )),
             RttChannelBuffer::Buffer64(h64) => {
-                core.read_word_64(ptr + h64.flags_offset() as u64)?
+                u64::from_be(core.read_word_64(ptr + h64.flags_offset() as u64)?)
             }
         })
     }
@@ -167,10 +178,13 @@ impl RttChannelBuffer {
     pub fn write_flags(&self, core: &mut Core, ptr: u64, flags: u64) -> Result<(), Error> {
         match self {
             RttChannelBuffer::Buffer32(h32) => {
-                core.write_word_32(ptr + h32.flags_offset() as u64, flags.try_into().unwrap())?;
+                core.write_word_32(
+                    ptr + h32.flags_offset() as u64,
+                    TryInto::<u32>::try_into(flags).unwrap().to_be(),
+                )?;
             }
             RttChannelBuffer::Buffer64(h64) => {
-                core.write_word_64(ptr + h64.flags_offset() as u64, flags)?;
+                core.write_word_64(ptr + h64.flags_offset() as u64, flags.to_be())?;
             }
         };
         Ok(())

@@ -222,24 +222,34 @@ impl Session {
             }
         }
 
+        tracing::trace!("Seeing if we can get a JTAG reference...");
         if let Some(jtag) = target.jtag.as_ref() {
+            tracing::trace!("Seeing if we can get the scan chain...");
             if let Some(scan_chain) = jtag.scan_chain.clone() {
+                tracing::trace!("Seeing if we can get the JTAG probe");
                 if let Some(probe) = probe.try_as_jtag_probe() {
+                    tracing::trace!("Setting the scan chain to {:?}", scan_chain);
                     probe.set_scan_chain(&scan_chain)?;
                 }
             }
         }
         probe.attach_to_unspecified()?;
+        tracing::trace!("Trying to see if probe is a JTAG probe.");
         if let Some(probe) = probe.try_as_jtag_probe() {
+            tracing::trace!("Probe is a JTAG probe. Checking scan chain...");
             if let Ok(chain) = probe.scan_chain() {
+                tracing::trace!("Scan chain discovered. Is it empty?");
                 if !chain.is_empty() {
+                    tracing::trace!("Scan chain isn't empty. Selecting each target...");
                     for core in &cores {
+                        tracing::trace!("Selecting target {}", core.interface_idx());
                         probe.select_target(core.interface_idx())?;
                     }
                 }
             }
         }
 
+        tracing::trace!("Attempting to turn it into an ARM interface");
         let interface = probe.try_into_arm_interface().map_err(|(_, err)| err)?;
 
         let mut interface = interface

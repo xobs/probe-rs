@@ -30,6 +30,7 @@ impl RawJtagIo for CmsisDap {
 
     fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError> {
         self.flush_jtag()?;
+        tracing::trace!("Returning captured bits: {:?}", self.jtag_buffer.response);
         Ok(std::mem::take(&mut self.jtag_buffer.response))
     }
 

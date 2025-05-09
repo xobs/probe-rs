@@ -123,7 +123,7 @@ impl<'a> Icepick<'a> {
             self.interface.swj_sequence(1, 1)?;
         }
 
-        // Entuer IR/DR CAPTURE -> EXIT1 -> PAUSE -> EXIT2 -> SHIFT state
+        // Enter IR/DR CAPTURE -> EXIT1 -> PAUSE -> EXIT2 -> SHIFT state
         self.interface.swj_sequence(5, 0b01010)?;
 
         // Shift out the bits
@@ -220,6 +220,7 @@ impl<'a> Icepick<'a> {
     /// <https://github.com/openocd-org/openocd/blob/master/tcl/target/icepick.cfg#L81-L124>
     /// A few things were removed to fit the cc13xx_cc26xx family.
     pub(crate) fn select_tap(&mut self, secondary_tap: u8) -> Result<(), ArmError> {
+        tracing::trace!("Selecting seconary tap {secondary_tap}");
         // Select the Connect register
         self.shift_ir(IR_CONNECT, JtagState::SelectDrScan)?;
         // Enable write, set the `ConnectKey` to 0b1001 (0x9) as per TRM section 6.3.3

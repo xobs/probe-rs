@@ -421,11 +421,11 @@ fn shift_ir(
 
     // Check the bit length, enough data has to be available
     if data.len() * 8 < len || len == 0 {
-        return Err(DebugProbeError::Other(format!(
+        panic!(
             "Invalid data length. IR bits: {}, expected: {}",
             data.len(),
             len
-        )));
+        );
     }
 
     // BYPASS commands before and after shifting out data where required
@@ -556,6 +556,14 @@ impl<Probe: RawJtagIo + 'static> JtagAccess for Probe {
     }
 
     fn set_scan_chain(&mut self, scan_chain: &[ScanChainElement]) -> Result<(), DebugProbeError> {
+        if let Some(existing) = &self.state().expected_scan_chain {
+            panic!(
+                "Set scan chain to {:?} -- the existing scan chain was {:?}",
+                scan_chain, existing
+            );
+        } else {
+            println!("Setting new expected scan chain to {:?}", scan_chain);
+        }
         self.state_mut().expected_scan_chain = Some(scan_chain.to_vec());
         Ok(())
     }
@@ -689,6 +697,7 @@ impl<Probe: RawJtagIo + 'static> JtagAccess for Probe {
         data: &[u8],
         len: u32,
     ) -> Result<BitVec, DebugProbeError> {
+        tracing::trace!("Probe write register");
         prepare_write_register(self, address, data, len, true)?;
 
         let response = self.read_captured_bits()?;
@@ -748,6 +757,11 @@ impl<Probe: RawJtagIo + 'static> JtagAccess for Probe {
         let mut bitstream = bitstream.as_bitslice();
         for (idx, command, bits) in bits.into_iter() {
             if idx.should_capture() {
+                tracing::trace!(
+                    "Bitstream slice (looking for {} bits in bitstream: {:?})",
+                    bits,
+                    bitstream
+                );
                 let response = &bitstream[..bits];
 
                 let result = match command {

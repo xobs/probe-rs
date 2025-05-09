@@ -11,7 +11,7 @@ use crate::probe::DebugProbeError;
 pub enum Error {
     /// An error with the usage of the probe occurred
     Probe(#[from] DebugProbeError),
-    /// An ARM specific error occurred.
+    /// An ARM specific error occurred: {0}
     Arm(#[source] ArmError),
     /// A RISC-V specific error occurred.
     Riscv(#[source] RiscvError),
