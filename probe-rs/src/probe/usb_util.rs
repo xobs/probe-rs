@@ -1,6 +1,9 @@
 use async_io::{Timer, block_on};
 use futures_lite::FutureExt;
-use nusb::{Interface, transfer::RequestBuffer};
+use nusb::{
+    Interface,
+    transfer::{Bulk, In, Out},
+};
 use std::{io, time::Duration};
 
 pub trait InterfaceExt {
@@ -10,12 +13,18 @@ pub trait InterfaceExt {
 
 impl InterfaceExt for Interface {
     fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> io::Result<usize> {
+        tracing::info!("Writing bulk data: {:x?}", buf);
         let fut = async {
+            let mut ep_out = self.endpoint::<Bulk, Out>(endpoint).unwrap();
             tracing::trace!("Writing data: {:x?}", buf);
-            let comp = self.bulk_out(endpoint, buf.to_vec()).await;
+            let mut transfer = ep_out.allocate(64);
+            transfer.extend_from_slice(buf);
+            ep_out.submit(transfer);
+            let Some(comp) = ep_out.wait_next_complete(timeout) else {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            };
             comp.status.map_err(io::Error::other)?;
-
-            let n = comp.data.actual_length();
+            let n = comp.actual_len;
             Ok(n)
         };
 
@@ -27,38 +36,25 @@ impl InterfaceExt for Interface {
 
     fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
         let fut = async {
-            if buf.len() > 64 {
-                let mut queue = self.bulk_in_queue(endpoint);
-                let n_transfers = buf.len() / 64;
-                let transfer_size = buf.len();
-                while queue.pending() < n_transfers {
-                    queue.submit(RequestBuffer::new(transfer_size));
-                }
+            let mut ep_in = self.endpoint::<Bulk, In>(endpoint).unwrap();
+            let transfer = ep_in.allocate(buf.len());
+            ep_in.submit(transfer);
+            let Some(comp) = ep_in.wait_next_complete(timeout) else {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            };
+            comp.status.map_err(io::Error::other)?;
 
-                let mut offset = 0;
-                let mut finished = false;
-                while offset < transfer_size && !finished {
-                    let comp = queue.next_complete().await;
-                    comp.status.map_err(io::Error::other)?;
-
-                    let n = comp.data.len();
-                    buf[offset..offset + n].copy_from_slice(&comp.data);
-                    offset += n;
-                    // Finish on ZLP or non-full buffer
-                    finished = n == 0 || n != 64;
-                    queue.submit(RequestBuffer::reuse(comp.data, transfer_size));
-                }
-                tracing::trace!("Read data: {:x?}", &buf[..offset]);
-                Ok(offset)
-            } else {
-                let comp = self.bulk_in(endpoint, RequestBuffer::new(buf.len())).await;
-                comp.status.map_err(io::Error::other)?;
-
-                let n = comp.data.len();
-                buf[..n].copy_from_slice(&comp.data);
-                tracing::trace!("Read data: {:x?}", &buf[..n]);
-                Ok(n)
+            let n = comp.actual_len;
+            // If we got some number of bytes that is divisible by
+            // wMaxPacketSize (and is nonzero), then we'll need to read a
+            // zero length packet.
+            if n != 0 && n % 64 == 0 {
+                ep_in.submit(ep_in.allocate(0));
+                ep_in.wait_next_complete(Duration::from_secs(1)).unwrap();
             }
+            buf[..n].copy_from_slice(&comp.buffer);
+            tracing::trace!("Read data: {:x?}", &buf[..n]);
+            Ok(n)
         };
 
         block_on(fut.or(async {
