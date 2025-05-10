@@ -15,7 +15,7 @@ use crate::{
     },
     probe::{
         CommandResult, DebugProbe, DebugProbeError, IoSequenceItem, JtagAccess, JtagCommandQueue,
-        JtagSequence, JtagWriteCommand, RawJtagIo, RawSwdIo, WireProtocol, common::bits_to_byte,
+        JtagSequence, JtagWriteCommand, RawSwdIo, WireProtocol, common::bits_to_byte,
     },
 };
 
@@ -914,7 +914,7 @@ fn parse_swd_response(resp: &[bool], direction: TransferDirection) -> Result<u32
 
 /// RawDapAccess implementation for probes that implement RawProtocolIo.
 // TODO: JTAG shouldn't be required, but an option - maybe via trait downcasting?
-impl<Probe: DebugProbe + RawSwdIo + RawJtagIo + JtagAccess + 'static> RawDapAccess for Probe {
+impl<Probe: DebugProbe + RawSwdIo + JtagAccess + 'static> RawDapAccess for Probe {
     fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
         let mut transfer = DapTransfer::read(address);
         perform_transfers(self, std::slice::from_mut(&mut transfer))?;
@@ -1137,7 +1137,7 @@ impl<Probe: DebugProbe + RawSwdIo + RawJtagIo + JtagAccess + 'static> RawDapAcce
     }
 
     fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
-        RawJtagIo::configure_jtag(self, skip_scan)
+        JtagAccess::configure_jtag(self, skip_scan)
     }
 }
 
@@ -1186,7 +1186,7 @@ mod test {
         error::Error,
         probe::{
             DebugProbe, DebugProbeError, IoSequenceItem, JtagAccess, JtagSequence, ProbeStatistics,
-            RawJtagIo, RawSwdIo, SwdSettings, WireProtocol,
+            RawSwdIo, SwdSettings, WireProtocol,
         },
     };
     use probe_rs_target::ScanChainElement;
@@ -1391,80 +1391,80 @@ mod test {
         }
     }
 
-    // impl JtagAccess for MockJaylink {
-    //     fn shift_raw_sequence(&mut self, _: JtagSequence) -> Result<BitVec, DebugProbeError> {
-    //         todo!()
-    //     }
+    impl JtagAccess for MockJaylink {
+        fn shift_raw_sequence(&mut self, _: JtagSequence) -> Result<BitVec, DebugProbeError> {
+            todo!()
+        }
 
-    //     fn set_scan_chain(&mut self, _: &[ScanChainElement]) -> Result<(), DebugProbeError> {
-    //         todo!()
-    //     }
+        fn set_scan_chain(&mut self, _: &[ScanChainElement]) -> Result<(), DebugProbeError> {
+            todo!()
+        }
 
-    //     fn scan_chain(&mut self) -> Result<&[ScanChainElement], DebugProbeError> {
-    //         todo!()
-    //     }
+        fn scan_chain(&mut self) -> Result<&[ScanChainElement], DebugProbeError> {
+            todo!()
+        }
 
-    //     fn tap_reset(&mut self) -> Result<(), DebugProbeError> {
-    //         todo!()
-    //     }
+        fn tap_reset(&mut self) -> Result<(), DebugProbeError> {
+            todo!()
+        }
 
-    //     fn read_register(&mut self, _address: u32, _len: u32) -> Result<BitVec, DebugProbeError> {
-    //         todo!()
-    //     }
+        fn read_register(&mut self, _address: u32, _len: u32) -> Result<BitVec, DebugProbeError> {
+            todo!()
+        }
 
-    //     fn set_idle_cycles(&mut self, idle_cycles: u8) -> Result<(), DebugProbeError> {
-    //         self.idle_cycles = idle_cycles;
-    //         Ok(())
-    //     }
+        fn set_idle_cycles(&mut self, idle_cycles: u8) -> Result<(), DebugProbeError> {
+            self.idle_cycles = idle_cycles;
+            Ok(())
+        }
 
-    //     fn idle_cycles(&self) -> u8 {
-    //         self.idle_cycles
-    //     }
+        fn idle_cycles(&self) -> u8 {
+            self.idle_cycles
+        }
 
-    //     fn write_register(
-    //         &mut self,
-    //         address: u32,
-    //         data: &[u8],
-    //         len: u32,
-    //     ) -> Result<BitVec, DebugProbeError> {
-    //         let jtag_value = data[..5].view_bits::<Lsb0>().load_le::<u64>();
+        fn write_register(
+            &mut self,
+            address: u32,
+            data: &[u8],
+            len: u32,
+        ) -> Result<BitVec, DebugProbeError> {
+            let jtag_value = data[..5].view_bits::<Lsb0>().load_le::<u64>();
 
-    //         // Always 35 bit transfers
-    //         assert_eq!(len, JTAG_DR_BIT_LENGTH);
+            // Always 35 bit transfers
+            assert_eq!(len, JTAG_DR_BIT_LENGTH);
 
-    //         let jtag_transaction = self.jtag_transactions.remove(0);
+            let jtag_transaction = self.jtag_transactions.remove(0);
 
-    //         assert_eq!(
-    //             jtag_transaction.ir_address,
-    //             address,
-    //             "Address mismatch with {} remaining transactions",
-    //             self.jtag_transactions.len()
-    //         );
+            assert_eq!(
+                jtag_transaction.ir_address,
+                address,
+                "Address mismatch with {} remaining transactions",
+                self.jtag_transactions.len()
+            );
 
-    //         if jtag_transaction.ir_address != JTAG_ABORT_IR_VALUE {
-    //             let value = (jtag_value >> 3) as u32;
-    //             let rnw = jtag_value & 1 == 1;
-    //             let dap_address = ((jtag_value & 0x6) << 1) as u32;
+            if jtag_transaction.ir_address != JTAG_ABORT_IR_VALUE {
+                let value = (jtag_value >> 3) as u32;
+                let rnw = jtag_value & 1 == 1;
+                let dap_address = ((jtag_value & 0x6) << 1) as u32;
 
-    //             assert_eq!(dap_address, jtag_transaction.address);
-    //             assert_eq!(rnw, jtag_transaction.read);
-    //             assert_eq!(value, jtag_transaction.value);
-    //         }
+                assert_eq!(dap_address, jtag_transaction.address);
+                assert_eq!(rnw, jtag_transaction.read);
+                assert_eq!(value, jtag_transaction.value);
+            }
 
-    //         self.performed_transfer_count += 1;
+            self.performed_transfer_count += 1;
 
-    //         let ret = jtag_transaction.result;
+            let ret = jtag_transaction.result;
 
-    //         let mut ret_vec = BitVec::new();
-    //         ret_vec.extend_from_bitslice(ret.to_le_bytes()[..5].view_bits::<Lsb0>());
+            let mut ret_vec = BitVec::new();
+            ret_vec.extend_from_bitslice(ret.to_le_bytes()[..5].view_bits::<Lsb0>());
 
-    //         Ok(ret_vec)
-    //     }
+            Ok(ret_vec)
+        }
 
-    //     fn write_dr(&mut self, _data: &[u8], _len: u32) -> Result<BitVec, DebugProbeError> {
-    //         unimplemented!()
-    //     }
-    // }
+        fn write_dr(&mut self, _data: &[u8], _len: u32) -> Result<BitVec, DebugProbeError> {
+            unimplemented!()
+        }
+    }
 
     impl RawSwdIo for MockJaylink {
         fn swd_io<S>(&mut self, swdio: S) -> Result<Vec<bool>, DebugProbeError>
@@ -1508,33 +1508,6 @@ mod test {
 
         fn probe_statistics(&mut self) -> &mut ProbeStatistics {
             &mut self.probe_statistics
-        }
-    }
-
-    impl RawJtagIo for MockJaylink {
-        fn state_mut(&mut self) -> &mut crate::probe::JtagDriverState {
-            todo!()
-        }
-
-        fn state(&self) -> &crate::probe::JtagDriverState {
-            todo!()
-        }
-
-        fn shift_bit(
-            &mut self,
-            tms: bool,
-            tdi: bool,
-            capture: bool,
-        ) -> Result<(), DebugProbeError> {
-            Err(DebugProbeError::CommandNotSupportedByProbe {
-                command_name: "shift_bit",
-            })
-        }
-
-        fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError> {
-            Err(DebugProbeError::CommandNotSupportedByProbe {
-                command_name: "read_captured_bits",
-            })
         }
     }
 

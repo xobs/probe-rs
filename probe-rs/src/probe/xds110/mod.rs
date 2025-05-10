@@ -4,20 +4,27 @@
 
 use std::fmt;
 
-use bitvec::{order::Lsb0, vec::BitVec, view::BitView};
+use bitvec::{
+    bitvec,
+    order::Lsb0,
+    vec::BitVec,
+    view::{AsBits, BitView},
+};
 use commands::JtagTransit;
-use nusb::DeviceInfo;
+use nusb::{DeviceInfo, MaybeFuture};
+use probe_rs_target::ScanChainElement;
 
 use self::usb_interface::Xds110UsbDevice;
 use super::{
-    JtagAccess, ProbeStatistics, RawJtagIo, RawSwdIo,
+    JtagAccess, ProbeStatistics, RawSwdIo,
     common::{JtagState, RegisterState},
 };
 use crate::{
     architecture::arm::{ArmCommunicationInterface, communication_interface::DapProbe},
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, JtagDriverState,
-        ProbeError, ProbeFactory, SwdSettings, WireProtocol,
+        ChainParams, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
+        JtagDriverState, ProbeError, ProbeFactory, SwdSettings, WireProtocol,
+        common::{common_sequence, extract_idcodes, extract_ir_lengths},
     },
 };
 
@@ -93,6 +100,7 @@ impl ProbeFactory for Xds110Factory {
             in_accumulator_capture: BitVec::new(),
             virtual_jtag_state: JtagState::Reset,
             jtag_state: JtagDriverState::default(),
+            current_ir: None,
         };
 
         xds110.init()?;
@@ -121,6 +129,7 @@ pub struct Xds110 {
     response: BitVec,
     in_accumulator_capture: BitVec,
     jtag_state: JtagDriverState,
+    current_ir: Option<u32>,
 }
 
 impl fmt::Debug for Xds110 {
@@ -195,7 +204,11 @@ impl Xds110 {
     }
 
     fn tck_delay_to_hz(tck: u32) -> u32 {
-        (1.0 / (tck as f64 + TCK_FREQ_INTERCEPT) * TCK_FREQ_SLOPE) as u32
+        if tck == 0 {
+            14_000_000
+        } else {
+            (1.0 / (tck as f64 + TCK_FREQ_INTERCEPT) * TCK_FREQ_SLOPE) as u32
+        }
     }
 
     fn accumulate_bit(
@@ -248,12 +261,9 @@ impl Xds110 {
             let result = self.device.send_command(commands::JtagScan {
                 bits: self.out_accumulator_bits as u16,
                 path: initial_state,
-                trans1: JtagTransit::Quickest,
-                // Note: We would like to go to either `JtagState::Exit1Dr` or `JtagState::Exit1Ir`
-                // here to stay in sync with our fake shadow state, but this results in errors
-                // from the probe, so we fake it by just going straight to `SelectDr`.
+                trans1: JtagTransit::ViaIdle,
                 end_state: JtagState::Idle,
-                trans2: JtagTransit::Quickest,
+                trans2: JtagTransit::ViaIdle,
                 pre: 0,
                 post: 0,
                 delay: 0,
@@ -280,13 +290,13 @@ impl Xds110 {
 
             let tdo_slice = &result.data.view_bits::<Lsb0>()[..self.out_accumulator_bits];
 
-            tracing::trace!("In accumulator capture: {:?}", self.in_accumulator_capture);
-            tracing::trace!("TDO slice: {:?}", tdo_slice);
-            tracing::trace!(
-                "Going to iterate through {} iac and {} tdo",
-                self.in_accumulator_capture.len(),
-                tdo_slice.len()
-            );
+            // tracing::trace!("In accumulator capture: {:?}", self.in_accumulator_capture);
+            // tracing::trace!("TDO slice: {:?}", tdo_slice);
+            // tracing::trace!(
+            //     "Going to iterate through {} iac and {} tdo",
+            //     self.in_accumulator_capture.len(),
+            //     tdo_slice.len()
+            // );
 
             for (capture, tdo) in self.in_accumulator_capture.drain(..).zip(tdo_slice) {
                 if capture {
@@ -519,92 +529,92 @@ impl RawSwdIo for Xds110 {
 //     }
 // }
 
-// /// JTAG helper functions
-// impl Xds110 {
-//     fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
-//         // Go to `IDLE` and not `RESET`, because resetting the state machine
-//         // will put the ICEPICK back into reset.
-//         self.device.send_command(commands::GotoJtagState {
-//             state: JtagState::Reset,
-//             transit: JtagTransit::Quickest,
-//         })?;
-//         Ok(())
-//     }
+/// JTAG helper functions
+impl Xds110 {
+    fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
+        // Go to `IDLE` and not `RESET`, because resetting the state machine
+        // will put the ICEPICK back into reset.
+        self.device.send_command(commands::GotoJtagState {
+            state: JtagState::Reset,
+            transit: JtagTransit::Quickest,
+        })?;
+        Ok(())
+    }
 
-//     fn shift_jtag(
-//         &mut self,
-//         register: JtagState,
-//         data: &[u8],
-//         mut register_bits: usize,
-//         capture_data: bool,
-//     ) -> Result<BitVec, DebugProbeError> {
-//         let response = self.device.send_command(commands::JtagScan {
-//             bits: register_bits as u16,
-//             path: register,
-//             trans1: JtagTransit::Quickest,
-//             // Note: We would like to go to either `JtagState::Exit1Dr` or `JtagState::Exit1Ir`
-//             // here to stay in sync with our fake shadow state, but this results in errors
-//             // from the probe, so we fake it by just going straight to `SelectDr`.
-//             end_state: JtagState::Dr(RegisterState::Select),
-//             trans2: JtagTransit::Quickest,
-//             pre: 0,
-//             post: 0,
-//             delay: 0,
-//             rep: 1,
-//             out_data: data.to_vec(),
-//             response_length: if capture_data {
-//                 register_bits as u16
-//             } else {
-//                 0
-//             },
-//         })?;
-//         self.probe_statistics.report_io();
-//         let mut result = BitVec::new();
-//         if capture_data {
-//             for byte in response.data {
-//                 for bit in 0..8 {
-//                     result.push(byte & 1 << bit != 0);
-//                     register_bits -= 1;
-//                     if register_bits == 0 {
-//                         break;
-//                     }
-//                 }
-//                 if register_bits == 0 {
-//                     break;
-//                 }
-//             }
-//         }
-//         Ok(result)
-//     }
+    fn shift_jtag(
+        &mut self,
+        register: JtagState,
+        data: &[u8],
+        mut register_bits: usize,
+        capture_data: bool,
+    ) -> Result<BitVec, DebugProbeError> {
+        let response = self.device.send_command(commands::JtagScan {
+            bits: register_bits as u16,
+            path: register,
+            trans1: JtagTransit::ViaIdle,
+            // Note: We would like to go to either `JtagState::Exit1Dr` or `JtagState::Exit1Ir`
+            // here to stay in sync with our fake shadow state, but this results in errors
+            // from the probe, so we fake it by just going straight to `SelectDr`.
+            end_state: JtagState::Dr(RegisterState::Select),
+            trans2: JtagTransit::ViaIdle,
+            pre: 0,
+            post: 0,
+            delay: 0,
+            rep: 1,
+            out_data: data.to_vec(),
+            response_length: if capture_data {
+                register_bits as u16
+            } else {
+                0
+            },
+        })?;
+        self.probe_statistics.report_io();
+        let mut result = BitVec::new();
+        if capture_data {
+            for byte in response.data {
+                for bit in 0..8 {
+                    result.push(byte & 1 << bit != 0);
+                    register_bits -= 1;
+                    if register_bits == 0 {
+                        break;
+                    }
+                }
+                if register_bits == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
 
-//     fn shift_dr(
-//         &mut self,
-//         data: &[u8],
-//         register_bits: usize,
-//         capture_data: bool,
-//     ) -> Result<BitVec, DebugProbeError> {
-//         self.shift_jtag(
-//             JtagState::Dr(RegisterState::Shift),
-//             data,
-//             register_bits,
-//             capture_data,
-//         )
-//     }
+    fn shift_dr(
+        &mut self,
+        data: &[u8],
+        register_bits: usize,
+        capture_data: bool,
+    ) -> Result<BitVec, DebugProbeError> {
+        self.shift_jtag(
+            JtagState::Dr(RegisterState::Shift),
+            data,
+            register_bits,
+            capture_data,
+        )
+    }
 
-//     fn shift_ir(
-//         &mut self,
-//         data: &[u8],
-//         register_bits: usize,
-//         capture_data: bool,
-//     ) -> Result<BitVec, DebugProbeError> {
-//         self.shift_jtag(
-//             JtagState::Ir(RegisterState::Shift),
-//             data,
-//             register_bits,
-//             capture_data,
-//         )
-//     }
-// }
+    fn shift_ir(
+        &mut self,
+        data: &[u8],
+        register_bits: usize,
+        capture_data: bool,
+    ) -> Result<BitVec, DebugProbeError> {
+        self.shift_jtag(
+            JtagState::Ir(RegisterState::Shift),
+            data,
+            register_bits,
+            capture_data,
+        )
+    }
+}
 
 // impl RawDapAccess for Xds110 {
 //     fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
@@ -819,208 +829,256 @@ impl RawSwdIo for Xds110 {
 //         Ok(())
 //     }
 // }
-// impl JTAGAccess for Xds110 {
-//     fn set_scan_chain(&mut self, scan_chain: &[ScanChainElement]) -> Result<(), DebugProbeError> {
-//         tracing::trace!("Setting scan chain to: {:?}", scan_chain);
-//         self.expected_scan_chain = Some(scan_chain.to_vec());
-//         Ok(())
-//     }
 
-//     fn scan_chain(&mut self) -> Result<&[ScanChainElement], DebugProbeError> {
-//         if !self.scan_chain.is_empty() {
-//             tracing::trace!("Scan chain already exists! Returning existing scan chain");
-//             return Ok(&self.scan_chain);
-//         }
+impl Xds110 {
+    fn make_out_data(
+        &self,
+        data: &[u8],
+        pre_bits: usize,
+        post_bits: usize,
+        length: usize,
+    ) -> BitVec<u8, Lsb0> {
+        std::iter::repeat_n(true, pre_bits)
+            .chain(data.as_bits::<Lsb0>()[..length].iter().map(|b| *b))
+            .chain(std::iter::repeat_n(true, post_bits))
+            .collect()
+    }
+}
 
-//         const MAX_CHAIN: usize = 8;
+impl JtagAccess for Xds110 {
+    fn set_scan_chain(&mut self, scan_chain: &[ScanChainElement]) -> Result<(), DebugProbeError> {
+        tracing::trace!("Setting scan chain to: {:?}", scan_chain);
+        self.jtag_state.expected_scan_chain = Some(scan_chain.to_vec());
+        self.jtag_state.scan_chain = scan_chain.to_vec();
+        Ok(())
+    }
 
-//         self.reset_jtag_state_machine()?;
+    fn scan_chain(&mut self) -> Result<&[ScanChainElement], DebugProbeError> {
+        if !self.jtag_state.scan_chain.is_empty() {
+            tracing::trace!("Scan chain already exists! Returning existing scan chain");
+            return Ok(&self.jtag_state.scan_chain);
+        }
 
-//         self.chain_params = ChainParams::default();
+        const MAX_CHAIN: usize = 8;
 
-//         let input = [0xFF; 4 * MAX_CHAIN];
+        self.reset_jtag_state_machine()?;
 
-//         let response = self.shift_dr(&input, input.len() * 8, true)?;
+        self.jtag_state.chain_params = ChainParams::default();
 
-//         tracing::debug!("DR: {:?}", response);
+        let input = [0xFF; 4 * MAX_CHAIN];
 
-//         let idcodes = extract_idcodes(&response)?;
+        let response = self.shift_dr(&input, input.len() * 8, true)?;
 
-//         tracing::info!(
-//             "JTAG DR scan complete, found {} TAPs. {:?}",
-//             idcodes.len(),
-//             idcodes
-//         );
+        tracing::debug!("DR: {:?}", response);
 
-//         tracing::debug!("Scanning JTAG chain for IR lengths");
+        let idcodes = extract_idcodes(&response)?;
 
-//         // First shift out all ones
-//         let input = vec![0xff; idcodes.len()];
-//         let response = self.shift_ir(&input, input.len() * 8, true)?;
+        tracing::info!(
+            "JTAG DR scan complete, found {} TAPs. {:?}",
+            idcodes.len(),
+            idcodes
+        );
 
-//         tracing::debug!("IR scan: {}", response);
+        tracing::debug!("Scanning JTAG chain for IR lengths");
 
-//         self.reset_jtag_state_machine()?;
+        // First shift out all ones
+        let input = vec![0xff; idcodes.len()];
+        let response = self.shift_ir(&input, input.len() * 8, true)?;
 
-//         // Next, shift out same amount of zeros, then ones to make sure the IRs contain BYPASS.
-//         let input = std::iter::repeat_n(0, idcodes.len())
-//             .chain(input.iter().copied())
-//             .collect::<Vec<_>>();
-//         let response_zeros = self.shift_ir(&input, input.len() * 8, true)?;
+        tracing::debug!("IR scan: {}", response);
 
-//         tracing::debug!("IR scan: {}", response_zeros);
+        self.reset_jtag_state_machine()?;
 
-//         let response = response.as_bitslice();
-//         let response = common_sequence(response, response_zeros.as_bitslice());
+        // Next, shift out same amount of zeros, then ones to make sure the IRs contain BYPASS.
+        let input = std::iter::repeat_n(0, idcodes.len())
+            .chain(input.iter().copied())
+            .collect::<Vec<_>>();
+        let response_zeros = self.shift_ir(&input, input.len() * 8, true)?;
 
-//         tracing::debug!("IR scan: {}", response);
+        tracing::debug!("IR scan: {}", response_zeros);
 
-//         let ir_lens = extract_ir_lengths(
-//             response,
-//             idcodes.len(),
-//             self.expected_scan_chain
-//                 .as_ref()
-//                 .map(|chain| {
-//                     chain
-//                         .iter()
-//                         .filter_map(|s| s.ir_len)
-//                         .map(|s| s as usize)
-//                         .collect::<Vec<usize>>()
-//                 })
-//                 .as_deref(),
-//         )?;
+        let response = response.as_bitslice();
+        let response = common_sequence(response, response_zeros.as_bitslice());
 
-//         tracing::info!("Found {} TAPs on reset scan", idcodes.len());
-//         tracing::debug!("Detected IR lens: {:?}", ir_lens);
+        tracing::debug!("IR scan: {}", response);
 
-//         let chain = idcodes
-//             .into_iter()
-//             .zip(ir_lens)
-//             .map(|(idcode, irlen)| ScanChainElement {
-//                 ir_len: Some(irlen as u8),
-//                 name: idcode.map(|i| i.to_string()),
-//             })
-//             .collect::<Vec<_>>();
+        let ir_lens = extract_ir_lengths(
+            response,
+            idcodes.len(),
+            self.jtag_state
+                .expected_scan_chain
+                .as_ref()
+                .map(|chain| {
+                    chain
+                        .iter()
+                        .filter_map(|s| s.ir_len)
+                        .map(|s| s as usize)
+                        .collect::<Vec<usize>>()
+                })
+                .as_deref(),
+        )?;
 
-//         self.scan_chain = chain;
+        tracing::info!("Found {} TAPs on reset scan", idcodes.len());
+        tracing::debug!("Detected IR lens: {:?}", ir_lens);
 
-//         // Select target 0 by default
-//         self.select_target(0)?;
+        let chain = idcodes
+            .into_iter()
+            .zip(ir_lens)
+            .map(|(idcode, irlen)| ScanChainElement {
+                ir_len: Some(irlen as u8),
+                name: idcode.map(|i| i.to_string()),
+            })
+            .collect::<Vec<_>>();
 
-//         Ok(self.scan_chain.as_slice())
-//     }
+        self.jtag_state.scan_chain = chain;
 
-//     fn tap_reset(&mut self) -> Result<(), DebugProbeError> {
-//         tracing::trace!("Resetting TAP");
-//         Ok(())
-//     }
+        // Select target 0 by default
+        self.select_target(0)?;
 
-//     /// Configures the probe to address the given target.
-//     fn select_target(&mut self, target: usize) -> Result<(), DebugProbeError> {
-//         if self.scan_chain.is_empty() {
-//             self.scan_chain()?;
-//         }
+        Ok(self.jtag_state.scan_chain.as_slice())
+    }
 
-//         let Some(params) = ChainParams::from_jtag_chain(&self.scan_chain, target) else {
-//             return Err(DebugProbeError::TargetNotFound);
-//         };
+    fn tap_reset(&mut self) -> Result<(), DebugProbeError> {
+        tracing::trace!("Resetting TAP");
+        Ok(())
+    }
 
-//         let max_ir_address = (1 << params.irlen) - 1;
+    /// Configures the probe to address the given target.
+    fn select_target(&mut self, target: usize) -> Result<(), DebugProbeError> {
+        if self.jtag_state.scan_chain.is_empty() {
+            self.scan_chain()?;
+        }
 
-//         tracing::debug!("Selecting JTAG TAP: {target}");
-//         tracing::debug!("Setting chain params: {params:?}");
-//         tracing::debug!("Setting max_ir_address to {max_ir_address}");
+        let Some(params) = ChainParams::from_jtag_chain(&self.jtag_state.scan_chain, target) else {
+            return Err(DebugProbeError::TargetNotFound);
+        };
 
-//         self.max_ir_address = max_ir_address;
-//         self.chain_params = params;
+        let max_ir_address = (1 << params.irlen) - 1;
 
-//         Ok(())
-//     }
+        tracing::debug!("Selecting JTAG TAP: {target}");
+        tracing::debug!("Setting chain params: {params:?}");
+        tracing::debug!("Setting max_ir_address to {max_ir_address}");
 
-//     fn set_idle_cycles(&mut self, idle_cycles: u8) -> Result<(), DebugProbeError> {
-//         tracing::trace!("Setting idle cycles to: {}", idle_cycles);
-//         self.idle_cycles = idle_cycles;
-//         Ok(())
-//     }
+        self.jtag_state.chain_params = params;
+        assert_eq!(self.jtag_state.max_ir_address(), max_ir_address);
+        self.current_ir = None;
 
-//     fn idle_cycles(&self) -> u8 {
-//         self.idle_cycles
-//     }
+        Ok(())
+    }
 
-//     fn write_register(
-//         &mut self,
-//         address: u32,
-//         data: &[u8],
-//         len: u32,
-//     ) -> Result<BitVec, DebugProbeError> {
-//         tracing::trace!(
-//             "Writing to register {}. Current chain params: {:?}",
-//             address,
-//             self.chain_params
-//         );
+    fn set_idle_cycles(&mut self, idle_cycles: u8) -> Result<(), DebugProbeError> {
+        tracing::trace!("Setting idle cycles to: {}", idle_cycles);
+        self.idle_cycles = idle_cycles;
+        Ok(())
+    }
 
-//         let result = self.device.send_command(commands::JtagScan {
-//             bits: len as u16,
-//             path: JtagState::ShiftDr,
-//             trans1: JtagTransit::Quickest,
-//             // Note: We would like to go to either `JtagState::Exit1Dr` or `JtagState::Exit1Ir`
-//             // here to stay in sync with our fake shadow state, but this results in errors
-//             // from the probe, so we fake it by just going straight to `SelectDr`.
-//             end_state: JtagState::SelectDr,
-//             trans2: JtagTransit::Quickest,
-//             pre: 0,
-//             post: 0,
-//             delay: 0,
-//             rep: 1,
-//             out_data: data.to_vec(),
-//             response_length: data.len() as _,
-//         })?;
-//         self.probe_statistics.report_io();
-//         tracing::trace!("Result from jtag scan: {:x?}", result);
+    fn idle_cycles(&self) -> u8 {
+        self.idle_cycles
+    }
 
-//         let ret_bytes = result.data;
-//         let mut ret = bitvec![0;32];
-//         for byte in ret_bytes.iter() {
-//             ret.extend_from_bitslice(byte.view_bits::<Lsb0>());
-//         }
-//         Ok(ret)
-//     }
-
-//     fn write_dr(&mut self, _data: &[u8], _len: u32) -> Result<BitVec, DebugProbeError> {
-//         Err(DebugProbeError::NotImplemented {
-//             function_name: "write_dr",
-//         })
-//     }
-// }
-
-impl RawJtagIo for Xds110 {
-    fn shift_bit(
+    fn write_register(
         &mut self,
-        tms: bool,
-        tdi: bool,
-        capture_tdo: bool,
-    ) -> Result<(), DebugProbeError> {
-        self.accumulate_bit(tms, tdi, capture_tdo)?;
-        self.state_mut().state.update(tms);
-        Ok(())
+        address: u32,
+        data: &[u8],
+        len: u32,
+    ) -> Result<BitVec, DebugProbeError> {
+        tracing::trace!(
+            "Writing to register {}. Current chain params: {:?}",
+            address,
+            self.jtag_state.chain_params
+        );
+
+        if self.current_ir != Some(address) {
+            tracing::trace!("Selecting IR {}", address);
+            let address_data = self.make_out_data(
+                &address.to_le_bytes(),
+                self.jtag_state.chain_params.irpre,
+                self.jtag_state.chain_params.irpost,
+                self.jtag_state.chain_params.irlen,
+            );
+            let address_len = address_data.len() as u16;
+            let out_data = address_data.into_vec();
+            let out_data_len = out_data.len() as u16;
+            // Note: The `pre` and `post` values don't appear to actually work. So we need to pack
+            // and unpack the pre and post bits ourselves.
+            let result = self.device.send_command(commands::JtagScan {
+                bits: address_len,
+                path: JtagState::Ir(RegisterState::Shift),
+                trans1: JtagTransit::ViaIdle,
+                // Note: We would like to go to either `JtagState::Exit1Dr` or `JtagState::Exit1Ir`
+                // here to stay in sync with our fake shadow state, but this results in errors
+                // from the probe, so we fake it by just going straight to `SelectDr`.
+                end_state: JtagState::Idle,
+                trans2: JtagTransit::ViaIdle,
+                pre: 0,
+                post: 0,
+                delay: 0,
+                rep: 1,
+                out_data,
+                response_length: out_data_len,
+            })?;
+            self.probe_statistics.report_io();
+            self.current_ir = Some(address);
+            tracing::trace!("Selected IR and got response: {:?}", result);
+        }
+
+        let out_data = self.make_out_data(
+            data,
+            self.jtag_state.chain_params.drpre,
+            self.jtag_state.chain_params.drpost,
+            len as usize,
+        );
+        let bits = out_data.len() as u16;
+        let out_data = out_data.into_vec();
+        let response_length = out_data.len() as u16;
+
+        let result = self.device.send_command(commands::JtagScan {
+            bits,
+            path: JtagState::Dr(RegisterState::Shift),
+            trans1: JtagTransit::ViaIdle,
+            // Note: We would like to go to either `JtagState::Exit1Dr` or `JtagState::Exit1Ir`
+            // here to stay in sync with our fake shadow state, but this results in errors
+            // from the probe, so we fake it by just going straight to `SelectDr`.
+            end_state: JtagState::Idle,
+            trans2: JtagTransit::ViaIdle,
+            pre: 0,
+            post: 0,
+            delay: 0,
+            rep: 1,
+            out_data,
+            response_length,
+        })?;
+        self.probe_statistics.report_io();
+        tracing::trace!("Result from jtag scan: {:x?}", result);
+
+        let ret_bytes = result.data;
+        let mut ret = bitvec![];
+        for byte in ret_bytes.iter() {
+            ret.extend_from_bitslice(byte.view_bits::<Lsb0>());
+        }
+        // std::process::exit(0);
+        Ok(ret)
     }
 
-    fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError> {
-        tracing::trace!("Returning captured bits: {:?}", self.response);
+    fn write_dr(&mut self, _data: &[u8], _len: u32) -> Result<BitVec, DebugProbeError> {
+        Err(DebugProbeError::NotImplemented {
+            function_name: "write_dr",
+        })
+    }
+
+    fn shift_raw_sequence(
+        &mut self,
+        sequence: super::JtagSequence,
+    ) -> Result<BitVec, DebugProbeError> {
+        let tms = std::iter::repeat(sequence.tms);
+        let tdi = sequence.data.into_iter();
+        let cap = std::iter::repeat(sequence.tdo_capture);
+
+        for ((tms, tdi), cap) in tms.into_iter().zip(tdi.into_iter()).zip(cap.into_iter()) {
+            self.accumulate_bit(tms, tdi, cap)?;
+            self.jtag_state.state.update(tms);
+        }
         Ok(std::mem::take(&mut self.response))
-    }
-
-    fn state_mut(&mut self) -> &mut JtagDriverState {
-        &mut self.jtag_state
-    }
-
-    fn state(&self) -> &JtagDriverState {
-        &self.jtag_state
-    }
-
-    fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
-        tracing::error!("Ignoring reset request");
-        Ok(())
     }
 
     fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
@@ -1043,6 +1101,57 @@ impl RawJtagIo for Xds110 {
         Ok(())
     }
 }
+
+// impl RawJtagIo for Xds110 {
+//     fn shift_bit(
+//         &mut self,
+//         tms: bool,
+//         tdi: bool,
+//         capture_tdo: bool,
+//     ) -> Result<(), DebugProbeError> {
+//         self.accumulate_bit(tms, tdi, capture_tdo)?;
+//         self.state_mut().state.update(tms);
+//         Ok(())
+//     }
+
+//     fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError> {
+//         tracing::trace!("Returning captured bits: {:?}", self.response);
+//         Ok(std::mem::take(&mut self.response))
+//     }
+
+//     fn state_mut(&mut self) -> &mut JtagDriverState {
+//         &mut self.jtag_state
+//     }
+
+//     fn state(&self) -> &JtagDriverState {
+//         &self.jtag_state
+//     }
+
+//     fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
+//         tracing::error!("Ignoring reset request");
+//         Ok(())
+//     }
+
+//     fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
+//         let ir_lengths = if skip_scan {
+//             if let Some(expected_scan_chain) = &self.jtag_state.expected_scan_chain {
+//                 self.jtag_state.scan_chain = expected_scan_chain.clone();
+//             }
+//             self.jtag_state
+//                 .expected_scan_chain
+//                 .as_ref()
+//                 .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
+//                 .unwrap_or_default()
+//         } else {
+//             return Err(DebugProbeError::NotImplemented {
+//                 function_name: "configure_jtag(false)",
+//             });
+//         };
+//         tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
+//         self.select_target(0)?;
+//         Ok(())
+//     }
+// }
 
 fn get_xds110_info(device: &DeviceInfo) -> Option<DebugProbeInfo> {
     for xds110 in XDS110_USB_DEVICES {
@@ -1067,7 +1176,7 @@ fn get_xds110_info(device: &DeviceInfo) -> Option<DebugProbeInfo> {
 #[tracing::instrument(skip_all)]
 fn list_xds110_devices() -> Vec<DebugProbeInfo> {
     tracing::debug!("Searching for XDS110 probes");
-    let Ok(devices) = nusb::list_devices() else {
+    let Ok(devices) = nusb::list_devices().wait() else {
         return vec![];
     };
     let mut probes = vec![];
