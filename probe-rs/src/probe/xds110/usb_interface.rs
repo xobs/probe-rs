@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use nusb::Interface;
+use nusb::{Interface, MaybeFuture};
 
 use crate::probe::{
     DebugProbeError, DebugProbeSelector, ProbeCreationError, usb_util::InterfaceExt,
@@ -29,7 +29,10 @@ impl Xds110UsbDevice {
         selector.serial_number = Some(serial.to_owned());
 
         let mut xds110_description = None;
-        'usb_list: for device in nusb::list_devices().map_err(ProbeCreationError::Usb)? {
+        'usb_list: for device in nusb::list_devices()
+            .wait()
+            .map_err(ProbeCreationError::Usb)?
+        {
             for xds110 in XDS110_USB_DEVICES {
                 if xds110.vid == device.vendor_id()
                     && xds110.pid == device.product_id()
@@ -47,7 +50,7 @@ impl Xds110UsbDevice {
         let mut endpoint_out = false;
         let mut endpoint_in = false;
 
-        let device_handle = device.open().map_err(ProbeCreationError::Usb)?;
+        let device_handle = device.open().wait().map_err(ProbeCreationError::Usb)?;
 
         let mut configs = device_handle.configurations();
         let Some(config) = configs.next() else {
@@ -84,6 +87,7 @@ impl Xds110UsbDevice {
         tracing::trace!("Aquired handle for probe");
         let device_handle = device_handle
             .claim_interface(xds110.interface)
+            .wait()
             .map_err(ProbeCreationError::Usb)?;
         tracing::trace!("Claimed interface 0 of USB device.");
 

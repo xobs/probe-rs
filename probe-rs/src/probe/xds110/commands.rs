@@ -423,7 +423,6 @@ impl Xds110Command for GetProbeInfo {
     }
 }
 
-#[derive(Debug)]
 pub struct JtagScan {
     /// Total number of bits to scan
     pub bits: u16,
@@ -459,6 +458,26 @@ pub struct JtagScan {
     pub response_length: u16,
 }
 
+impl core::fmt::Debug for JtagScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "JtagScan {{ bits: {}, path: {:?}, trans1: {:?}, end_state: {:?}, trans2: {:?}, pre: {}, post: {}, delay: {}, rep: {}, out_data: {:02x?}, response_length: {} }}",
+            self.bits,
+            self.path,
+            self.trans1,
+            self.end_state,
+            self.trans2,
+            self.pre,
+            self.post,
+            self.delay,
+            self.rep,
+            self.out_data,
+            self.response_length
+        )
+    }
+}
+
 impl Xds110Command for JtagScan {
     const COMMAND_ID: CommandId = CommandId::JtagScan;
 
@@ -484,10 +503,20 @@ impl Xds110Command for JtagScan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JtagScanResponse {
     pub result: i32,
     pub data: Vec<u8>,
+}
+
+impl core::fmt::Debug for JtagScanResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "JtagScanResponse {{ result: {}, data: {:02x?} }}",
+            self.result, self.data
+        )
+    }
 }
 
 impl Xds110CommandResponse for JtagScanResponse {
