@@ -2,7 +2,7 @@
 //!
 //! The protocol is mostly undocumented, though openocd does have support.
 
-use std::fmt;
+use std::{fmt, num::NonZeroI32};
 
 use bitvec::{
     bitvec,
@@ -10,17 +10,19 @@ use bitvec::{
     vec::BitVec,
     view::{AsBits, BitView},
 };
-use commands::JtagTransit;
+use commands::{CjtagMode, JtagTransit};
 use nusb::{DeviceInfo, MaybeFuture};
 use probe_rs_target::ScanChainElement;
 
 use self::usb_interface::Xds110UsbDevice;
 use super::{
-    JtagAccess, ProbeStatistics, RawSwdIo,
+    JtagAccess, ProbeStatistics,
     common::{JtagState, RegisterState},
 };
 use crate::{
-    architecture::arm::{ArmCommunicationInterface, communication_interface::DapProbe},
+    architecture::arm::{
+        ArmCommunicationInterface, RawDapAccess, communication_interface::DapProbe,
+    },
     probe::{
         ChainParams, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
         JtagDriverState, ProbeError, ProbeFactory, SwdSettings, WireProtocol,
@@ -101,6 +103,7 @@ impl ProbeFactory for Xds110Factory {
             virtual_jtag_state: JtagState::Reset,
             jtag_state: JtagDriverState::default(),
             current_ir: None,
+            current_tap: None,
         };
 
         xds110.init()?;
@@ -130,6 +133,7 @@ pub struct Xds110 {
     in_accumulator_capture: BitVec,
     jtag_state: JtagDriverState,
     current_ir: Option<u32>,
+    current_tap: Option<u8>,
 }
 
 impl fmt::Debug for Xds110 {
@@ -156,6 +160,7 @@ impl Xds110 {
     fn init(&mut self) -> Result<(), DebugProbeError> {
         tracing::debug!("Initializing XDS110...");
 
+        self.device.drain()?;
         let connect_response = self.device.send_command(commands::Connect)?;
         if connect_response.result != 0 {
             tracing::debug!("Unexpected `connect` response: {}", connect_response.result);
@@ -372,7 +377,8 @@ impl DebugProbe for Xds110 {
         if protocol == WireProtocol::Jtag {
             // Connect to the JTAG machinery and go to the RESET state
             self.virtual_jtag_state = JtagState::Reset;
-            self.device.send_command(commands::CjtagConnect(1))?;
+            self.device
+                .send_command(commands::CjtagConnect(CjtagMode::Jtag))?;
             self.device.send_command(commands::GotoJtagState {
                 state: self.virtual_jtag_state,
                 transit: JtagTransit::Quickest,
@@ -416,118 +422,6 @@ impl DebugProbe for Xds110 {
 }
 
 impl DapProbe for Xds110 {}
-
-impl RawSwdIo for Xds110 {
-    fn swd_io<S>(&mut self, _swdio: S) -> Result<Vec<bool>, DebugProbeError>
-    where
-        S: IntoIterator<Item = super::IoSequenceItem>,
-    {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "swd_io",
-        })
-    }
-
-    fn swj_pins(
-        &mut self,
-        _pin_out: u32,
-        _pin_select: u32,
-        _pin_wait: u32,
-    ) -> Result<u32, DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "swj_pins",
-        })
-    }
-
-    fn swd_settings(&self) -> &SwdSettings {
-        &self.swd_settings
-    }
-
-    fn probe_statistics(&mut self) -> &mut super::ProbeStatistics {
-        &mut self.probe_statistics
-    }
-}
-
-// impl RawProtocolIo for Xds110 {
-//     /// Shift TMS state. This doesn't actually send any data out, rather it
-//     /// updates our own internal state that will be synchronized when we write
-//     /// actual data in `jtag_shift_tdi`.
-//     fn jtag_shift_tms<M>(&mut self, tms: M, tdi: bool) -> Result<(), DebugProbeError>
-//     where
-//         M: IntoIterator<Item = bool>,
-//     {
-//         for tms in tms {
-//             self.accumulate_bit(tms, tdi, false)?;
-//         }
-//         Ok(())
-//     }
-
-//     /// Shift bits out. Must be in the correct state.
-//     fn jtag_shift_tdi<I>(&mut self, tms: bool, tdi: I) -> Result<(), DebugProbeError>
-//     where
-//         I: IntoIterator<Item = bool>,
-//     {
-//         for tdi in tdi {
-//             self.accumulate_bit(tms, tdi, false)?;
-//         }
-//         Ok(())
-//     }
-
-//     fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
-//         let ir_lengths = if skip_scan {
-//             if let Some(expected_scan_chain) = &self.jtag_state.expected_scan_chain {
-//                 self.jtag_state.scan_chain = expected_scan_chain.clone();
-//             }
-//             self.jtag_state
-//                 .expected_scan_chain
-//                 .as_ref()
-//                 .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
-//                 .unwrap_or_default()
-//         } else {
-//             todo!();
-//             // let chain = self.jtag_scan(
-//             //     self.jtag_state
-//             //         .expected_scan_chain
-//             //         .as_ref()
-//             //         .map(|chain| {
-//             //             chain
-//             //                 .iter()
-//             //                 .filter_map(|s| s.ir_len)
-//             //                 .map(|s| s as usize)
-//             //                 .collect::<Vec<usize>>()
-//             //         })
-//             //         .as_deref(),
-//             // )?;
-//             // chain.iter().map(|item| item.ir_len()).collect()
-//         };
-//         tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
-//         self.select_target(0)?;
-//         Ok(())
-//     }
-
-//     fn swd_io<S>(&mut self, _swdio: S) -> Result<Vec<bool>, DebugProbeError>
-//     where
-//         S: IntoIterator<Item = super::arm_debug_interface::IoSequenceItem>,
-//     {
-//         todo!()
-//     }
-
-//     fn swj_pins(
-//         &mut self,
-//         _pin_out: u32,
-//         _pin_select: u32,
-//         _pin_wait: u32,
-//     ) -> Result<u32, DebugProbeError> {
-//         todo!()
-//     }
-
-//     fn swd_settings(&self) -> &SwdSettings {
-//         &self.swd_settings
-//     }
-
-//     fn probe_statistics(&mut self) -> &mut ProbeStatistics {
-//         &mut self.probe_statistics
-//     }
-// }
 
 /// JTAG helper functions
 impl Xds110 {
@@ -616,219 +510,150 @@ impl Xds110 {
     }
 }
 
-// impl RawDapAccess for Xds110 {
-//     fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
-//         let mut transfer = DapTransfer::read(address);
-//         perform_transfers(self, std::slice::from_mut(&mut transfer))?;
+impl RawDapAccess for Xds110 {
+    fn raw_read_register(
+        &mut self,
+        address: crate::architecture::arm::RegisterAddress,
+    ) -> Result<u32, crate::architecture::arm::ArmError> {
+        let command = match address {
+            crate::architecture::arm::RegisterAddress::DpRegister(dp_register_address) => {
+                (1, 0, dp_register_address.address)
+            }
+            crate::architecture::arm::RegisterAddress::ApRegister(reg) => (0, 1, reg),
+        };
+        let value = self
+            .device
+            .send_command(commands::CmapiDapRegRead {
+                is_dp: command.0,
+                is_ap: command.1,
+                register: command.2,
+            })?
+            .value;
+        Ok(value)
+    }
 
-//         match transfer.status {
-//             TransferStatus::Ok => Ok(transfer.value),
-//             TransferStatus::Failed(DapError::FaultResponse) => {
-//                 tracing::debug!("DAP FAULT");
+    fn raw_write_register(
+        &mut self,
+        address: crate::architecture::arm::RegisterAddress,
+        value: u32,
+    ) -> Result<(), crate::architecture::arm::ArmError> {
+        let command = match address {
+            crate::architecture::arm::RegisterAddress::DpRegister(dp_register_address) => {
+                (1, 0, dp_register_address.address)
+            }
+            crate::architecture::arm::RegisterAddress::ApRegister(reg) => (0, 1, reg),
+        };
+        self.device.send_command(commands::CmapiDapRegWrite {
+            is_dp: command.0,
+            is_ap: command.1,
+            register: command.2,
+            value,
+        })?;
+        Ok(())
+    }
 
-//                 // A fault happened during operation.
+    fn jtag_sequence(&mut self, cycles: u8, tms: bool, tdi: u64) -> Result<(), DebugProbeError> {
+        for index in 0..cycles {
+            self.accumulate_bit(tms, tdi & 1 << index != 0, false)?;
+        }
+        Ok(())
+    }
 
-//                 // To get a clue about the actual fault we want to read the ctrl register,
-//                 // which will have the fault status flags set. But we only do this
-//                 // if we are *not* currently reading the ctrl register, otherwise
-//                 // this could end up being an endless recursion.
+    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
+        for index in 0..bit_len {
+            self.accumulate_bit(bits & 1 << index != 0, false, false)?;
+        }
+        Ok(())
+    }
 
-//                 if address == CTRL_PORT {
-//                     //  This is not necessarily the CTRL/STAT register, because the dpbanksel field in the SELECT register
-//                     //  might be set so that the read wasn't actually from the CTRL/STAT register.
-//                     tracing::debug!(
-//                         "Read might have been from CTRL/STAT register, not reading it again to dermine fault reason"
-//                     );
+    fn swj_pins(
+        &mut self,
+        _pin_out: u32,
+        _pin_select: u32,
+        _pin_wait: u32,
+    ) -> Result<u32, DebugProbeError> {
+        Err(DebugProbeError::NotImplemented {
+            function_name: "swj_pins",
+        })
+    }
 
-//                     // We still clear the sticky error, otherwise all future accesses will fail.
-//                     //
-//                     // We also assume that we use overrun detection, so we clear the overrun error as well.
-//                     clear_overrun_and_sticky_err(self)?;
-//                 } else {
-//                     // Reading the CTRL/AP register depends on the dpbanksel register, but we don't know
-//                     // here what the value of it is. So this will fail if dpbanksel is not set to 0,
-//                     // but there is no way of figuring that out here, because reading the SELECT register
-//                     // would also fail.
-//                     //
-//                     // What might happen is that the read fails, but that would then trigger another fault handling,
-//                     // so it all ends up working.
-//                     tracing::debug!("Reading CTRL/AP register to determine reason for FAULT");
-//                     let response = RawDapAccess::raw_read_register(self, CTRL_PORT)?;
-//                     let ctrl = Ctrl::try_from(response)?;
-//                     tracing::debug!(
-//                         "Reading DAP register failed. Ctrl/Stat register value is: {:#?}",
-//                         ctrl
-//                     );
+    fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
+        self
+    }
 
-//                     // Check the reason for the fault
-//                     // Other fault reasons than overrun or write error are not handled yet.
-//                     if ctrl.sticky_orun() || ctrl.sticky_err() {
-//                         // Clear the error state
-//                         clear_overrun_and_sticky_err(self)?;
-//                     }
-//                 }
+    fn core_status_notification(
+        &mut self,
+        _state: crate::CoreStatus,
+    ) -> Result<(), DebugProbeError> {
+        Ok(())
+    }
 
-//                 Err(DapError::FaultResponse.into())
-//             }
-//             // The other errors mean that something went wrong with the protocol itself.
-//             // There's no guaranteed correct way to recover, so don't.
-//             TransferStatus::Failed(e) => Err(e.into()),
-//             other => panic!(
-//                 "Unexpected transfer state after reading register: {other:?}. This is a bug!"
-//             ),
-//         }
-//     }
+    fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
+        if skip_scan {
+            if let Some(expected_scan_chain) = &self.jtag_state.expected_scan_chain {
+                self.jtag_state.scan_chain = expected_scan_chain.clone();
+            }
+            let ir_lengths = self
+                .jtag_state
+                .expected_scan_chain
+                .as_ref()
+                .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
+                .unwrap_or_default();
+            tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
+        } else {
+            return Err(DebugProbeError::NotImplemented {
+                function_name: "configure_jtag(false)",
+            });
+        };
 
-//     fn raw_read_block(
-//         &mut self,
-//         address: RegisterAddress,
-//         values: &mut [u32],
-//     ) -> Result<(), ArmError> {
-//         let mut transfers = vec![DapTransfer::read(address); values.len()];
+        self.device.send_command(commands::GotoJtagState {
+            state: JtagState::Idle,
+            transit: JtagTransit::Quickest,
+        })?;
+        self.device.send_command(commands::CycleTclk(10))?;
 
-//         perform_transfers(self, &mut transfers)?;
+        let Some(xds110_target) = self
+            .jtag_state
+            .scan_chain
+            .len()
+            .checked_sub(1)
+            .and_then(|l| l.checked_sub(0))
+            .and_then(|v| u8::try_from(v).ok())
+        else {
+            return Err(Xds110Error::ConfigurationNotFound.into());
+        };
 
-//         for (i, result) in transfers.iter().enumerate() {
-//             match result.status {
-//                 TransferStatus::Ok => values[i] = result.value,
-//                 TransferStatus::Failed(err) => {
-//                     tracing::info!(
-//                         "Error in access {}/{} of block access: {:?}",
-//                         i + 1,
-//                         values.len(),
-//                         err
-//                     );
+        if let Some(existing) = self.current_tap.replace(xds110_target) {
+            // No need to change target
+            if existing == xds110_target {
+                return Ok(());
+            }
+            self.device.send_command(commands::DeselectTap {
+                unknown1: 0x2000_0000,
+                irpre: 0,
+                irpost: 0,
+                drpre: 0,
+                drpost: 0,
+                unknown2: 0x43,
+            })?;
+        }
 
-//                     // TODO: The error reason could be investigated by reading the CTRL/STAT register here,
+        self.device
+            .send_command(commands::SetAmbleDelay {
+                irpre: self.jtag_state.chain_params.irpre as _,
+                irpost: self.jtag_state.chain_params.irpost as _,
+                drpre: self.jtag_state.chain_params.drpre as _,
+                drpost: self.jtag_state.chain_params.drpost as _,
+            })
+            .unwrap();
 
-//                     if err == DapError::FaultResponse {
-//                         clear_overrun_and_sticky_err(self)?;
-//                     }
+        let response = self.device.send_command(commands::CmapiConnect {})?;
+        tracing::info!("Connected to CMAPI device {:08x}", response.idcode);
 
-//                     return Err(err.into());
-//                 }
-//                 other => panic!(
-//                     "Unexpected transfer state after reading registers: {other:?}. This is a bug!"
-//                 ),
-//             }
-//         }
-
-//         Ok(())
-//     }
-
-//     fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
-//         let mut transfer = DapTransfer::write(address, value);
-
-//         perform_transfers(self, std::slice::from_mut(&mut transfer))?;
-
-//         match transfer.status {
-//             TransferStatus::Ok => Ok(()),
-//             TransferStatus::Failed(DapError::FaultResponse) => {
-//                 tracing::warn!("DAP FAULT");
-//                 // A fault happened during operation.
-
-//                 // To get a clue about the actual fault we read the ctrl register,
-//                 // which will have the fault status flags set.
-
-//                 // This read might fail because the dpbanksel register is not set to 0.
-//                 let response = RawDapAccess::raw_read_register(self, CTRL_PORT)?;
-
-//                 let ctrl = Ctrl::try_from(response)?;
-//                 tracing::warn!(
-//                     "Writing DAP register failed. Ctrl/Stat register value is: {:#?}",
-//                     ctrl
-//                 );
-
-//                 // Check the reason for the fault
-//                 // Other fault reasons than overrun or write error are not handled yet.
-//                 if ctrl.sticky_orun() || ctrl.sticky_err() {
-//                     // We did not handle a WAIT state properly
-
-//                     // Because we use overrun detection, we now have to clear the overrun error
-//                     clear_overrun_and_sticky_err(self)?;
-//                 }
-
-//                 Err(DapError::FaultResponse.into())
-//             }
-//             // The other errors mean that something went wrong with the protocol itself.
-//             // There's no guaranteed correct way to recover, so don't.
-//             TransferStatus::Failed(e) => Err(e.into()),
-//             other => panic!(
-//                 "Unexpected transfer state after writing register: {other:?}. This is a bug!"
-//             ),
-//         }
-//     }
-
-//     fn raw_write_block(
-//         &mut self,
-//         address: RegisterAddress,
-//         values: &[u32],
-//     ) -> Result<(), ArmError> {
-//         let mut transfers = values
-//             .iter()
-//             .map(|v| DapTransfer::write(address, *v))
-//             .collect::<Vec<_>>();
-
-//         perform_transfers(self, &mut transfers)?;
-
-//         for (i, result) in transfers.iter().enumerate() {
-//             match result.status {
-//                 TransferStatus::Ok => {}
-//                 TransferStatus::Failed(err) => {
-//                     tracing::debug!(
-//                         "Error in access {}/{} of block access: {}",
-//                         i + 1,
-//                         values.len(),
-//                         err
-//                     );
-
-//                     // TODO: The error reason could be investigated by reading the CTRL/STAT register here,
-//                     if err == DapError::FaultResponse {
-//                         clear_overrun_and_sticky_err(self)?;
-//                     }
-
-//                     return Err(err.into());
-//                 }
-//                 other => panic!(
-//                     "Unexpected transfer state after writing registers: {other:?}. This is a bug!"
-//                 ),
-//             }
-//         }
-
-//         Ok(())
-//     }
-
-//     fn jtag_sequence(&mut self, cycles: u8, tms: bool, tdi: u64) -> Result<(), DebugProbeError> {
-//         for bit in 0..cycles {
-//             self.accumulate_bit(tms, tdi & 1 << bit != 0, false)?
-//         }
-//         Ok(())
-//     }
-
-//     fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
-//         todo!()
-//     }
-
-//     fn swj_pins(
-//         &mut self,
-//         _pin_out: u32,
-//         _pin_select: u32,
-//         _pin_wait: u32,
-//     ) -> Result<u32, DebugProbeError> {
-//         todo!()
-//     }
-
-//     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
-//         self
-//     }
-
-//     fn core_status_notification(
-//         &mut self,
-//         _state: crate::CoreStatus,
-//     ) -> Result<(), DebugProbeError> {
-//         Ok(())
-//     }
-// }
+        self.select_target(0)?;
+        Ok(())
+    }
+}
 
 impl Xds110 {
     fn make_out_data(
@@ -953,14 +778,10 @@ impl JtagAccess for Xds110 {
             return Err(DebugProbeError::TargetNotFound);
         };
 
-        let max_ir_address = (1 << params.irlen) - 1;
-
         tracing::debug!("Selecting JTAG TAP: {target}");
         tracing::debug!("Setting chain params: {params:?}");
-        tracing::debug!("Setting max_ir_address to {max_ir_address}");
 
         self.jtag_state.chain_params = params;
-        assert_eq!(self.jtag_state.max_ir_address(), max_ir_address);
         self.current_ir = None;
 
         Ok(())
@@ -1080,26 +901,6 @@ impl JtagAccess for Xds110 {
         }
         Ok(std::mem::take(&mut self.response))
     }
-
-    fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
-        let ir_lengths = if skip_scan {
-            if let Some(expected_scan_chain) = &self.jtag_state.expected_scan_chain {
-                self.jtag_state.scan_chain = expected_scan_chain.clone();
-            }
-            self.jtag_state
-                .expected_scan_chain
-                .as_ref()
-                .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
-                .unwrap_or_default()
-        } else {
-            return Err(DebugProbeError::NotImplemented {
-                function_name: "configure_jtag(false)",
-            });
-        };
-        tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
-        self.select_target(0)?;
-        Ok(())
-    }
 }
 
 // impl RawJtagIo for Xds110 {
@@ -1197,6 +998,9 @@ pub(crate) enum Xds110Error {
 
     /// Magic value of `*` was not found.
     MagicValueNotFound,
+
+    /// The probe returned an error {0}.
+    RemoteError(NonZeroI32),
 
     /// Not enough bytes read.
     NotEnoughBytesRead { is: usize, should: usize },

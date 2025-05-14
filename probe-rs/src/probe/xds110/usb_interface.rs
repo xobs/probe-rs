@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{num::NonZeroI32, time::Duration};
 
 use nusb::{Interface, MaybeFuture};
 
@@ -102,6 +102,29 @@ impl Xds110UsbDevice {
         Ok(usb_wlink)
     }
 
+    pub(crate) fn drain(&mut self) -> Result<(), DebugProbeError> {
+        let mut rxbuf = [0u8; 4096];
+        loop {
+            let result =
+                self.device_handle
+                    .read_bulk(self.epin, &mut rxbuf[..], Duration::from_millis(1));
+            match result {
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::TimedOut {
+                        tracing::trace!("Read timed out");
+                        break;
+                    } else {
+                        return Err(DebugProbeError::Usb(error));
+                    }
+                }
+                Ok(val) => {
+                    tracing::debug!("Got buffered response: {}", val);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn send_command<C: Xds110Command + std::fmt::Debug>(
         &mut self,
         cmd: C,
@@ -133,10 +156,10 @@ impl Xds110UsbDevice {
             .read_bulk(self.epin, &mut rxbuf[..], timeout)
             .map_err(DebugProbeError::Usb)?;
 
-        if read_bytes < 3 {
+        if read_bytes < 7 {
             return Err(Xds110Error::NotEnoughBytesRead {
                 is: read_bytes,
-                should: 3,
+                should: 7,
             }
             .into());
         }
@@ -145,13 +168,19 @@ impl Xds110UsbDevice {
             return Err(Xds110Error::MagicValueNotFound.into());
         }
 
-        let payload_bytes = u16::from_le_bytes(rxbuf[1..=2].try_into().unwrap()) as usize;
+        let payload_bytes = u16::from_le_bytes(rxbuf[1..3].try_into().unwrap()) as usize;
         if read_bytes != payload_bytes + 3 {
             return Err(Xds110Error::NotEnoughBytesRead {
                 is: read_bytes,
                 should: payload_bytes + 3,
             }
             .into());
+        }
+
+        // Every command has a `result` located directly after the `size`. A `0`
+        // indicates success.
+        if let Some(error) = NonZeroI32::new(i32::from_le_bytes(rxbuf[3..7].try_into().unwrap())) {
+            return Err(Xds110Error::RemoteError(error).into());
         }
 
         let response = cmd.parse_response(&rxbuf[3..read_bytes])?;

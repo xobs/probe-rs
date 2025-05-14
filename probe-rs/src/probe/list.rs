@@ -109,8 +109,8 @@ impl AllProbesLister {
     const DRIVERS: &'static [&'static dyn ProbeFactory] = &[
         &blackmagic::BlackMagicProbeFactory,
         // Place Xds110Factory above CmsisDapFactory so it gets used in Xds110 mode
-        &xds110::Xds110Factory,
         &cmsisdap::CmsisDapFactory,
+        &xds110::Xds110Factory,
         &ftdi::FtdiProbeFactory,
         &stlink::StLinkFactory,
         &jlink::JLinkFactory,

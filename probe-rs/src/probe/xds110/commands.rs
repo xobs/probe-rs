@@ -71,7 +71,7 @@ pub enum CommandId {
     CjtagConnect = 0x2b,
     CjtagDisconnect = 0x2c,
     SelectTap = 0x2d,
-    DeselctTap = 0x2e,
+    DeselectTap = 0x2e,
     JtagIsolate = 0x2f,
     EtSetupRange = 0x30,
     EtSetupDig = 0x31,
@@ -122,6 +122,12 @@ impl TryFrom<u32> for JtagTransit {
             _ => return Err("Unrecognized value"),
         })
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(u32)]
+pub enum CjtagMode {
+    Jtag = 1,
 }
 
 fn jtag_state_to_xds110(jtag: JtagState) -> u32 {
@@ -423,6 +429,62 @@ impl Xds110Command for GetProbeInfo {
     }
 }
 
+#[derive(Debug)]
+pub struct SendScan {
+    /// Total number of bits to scan
+    pub bits: u16,
+
+    /// IR vs DR path
+    pub path: JtagState,
+
+    /// Start state route
+    pub trans1: JtagTransit,
+
+    /// JTAG state after scan
+    pub end_state: JtagState,
+
+    /// End state route
+    pub trans2: JtagTransit,
+
+    /// Number of preamble bits
+    pub pre: u16,
+
+    /// Number of postamble bits
+    pub post: u16,
+
+    /// Number of extra TCKs after scan
+    pub delay: u16,
+
+    /// Number of repetitions
+    pub rep: u16,
+
+    /// Data to be transmitted
+    pub out_data: Vec<u8>,
+}
+
+impl Xds110Command for SendScan {
+    const COMMAND_ID: CommandId = CommandId::SendScan;
+
+    type Response = GenericResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![];
+        payload.extend_from_slice(&self.bits.to_le_bytes());
+        payload.extend_from_slice(&(jtag_state_to_xds110(self.path) as u8).to_le_bytes());
+        payload.extend_from_slice(&(self.trans1 as u8).to_le_bytes());
+        payload.extend_from_slice(&(jtag_state_to_xds110(self.end_state) as u8).to_le_bytes());
+        payload.extend_from_slice(&(self.trans2 as u8).to_le_bytes());
+        payload.extend_from_slice(&self.pre.to_le_bytes());
+        payload.extend_from_slice(&self.post.to_le_bytes());
+        payload.extend_from_slice(&self.delay.to_le_bytes());
+        payload.extend_from_slice(&self.rep.to_le_bytes());
+        payload.extend_from_slice(&(self.out_data.len() as u16).to_le_bytes());
+        // Stick the output data onto the output buffer
+        payload.extend_from_slice(&self.out_data);
+        payload
+    }
+}
+
 pub struct JtagScan {
     /// Total number of bits to scan
     pub bits: u16,
@@ -535,7 +597,7 @@ impl Xds110CommandResponse for JtagScanResponse {
 }
 
 #[derive(Debug)]
-pub struct CjtagConnect(pub u32);
+pub struct CjtagConnect(pub CjtagMode);
 
 impl Xds110Command for CjtagConnect {
     const COMMAND_ID: CommandId = CommandId::CjtagConnect;
@@ -543,6 +605,283 @@ impl Xds110Command for CjtagConnect {
     type Response = GenericResponse;
 
     fn payload(&self) -> Vec<u8> {
-        self.0.to_le_bytes().to_vec()
+        (self.0 as u32).to_le_bytes().to_vec()
+    }
+}
+
+#[derive(Debug)]
+pub struct DeselectTap {
+    /// Usually 0x2000_0000
+    pub unknown1: u32,
+    pub irpre: u32,
+    pub irpost: u32,
+    pub drpre: u32,
+    pub drpost: u32,
+    /// This value is usually 0x43
+    pub unknown2: u8,
+}
+
+impl Xds110Command for DeselectTap {
+    const COMMAND_ID: CommandId = CommandId::DeselectTap;
+
+    type Response = GenericResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![];
+        payload.extend_from_slice(&self.unknown1.to_le_bytes());
+        payload.extend_from_slice(&self.irpre.to_le_bytes());
+        payload.extend_from_slice(&self.irpost.to_le_bytes());
+        payload.extend_from_slice(&self.drpre.to_le_bytes());
+        payload.extend_from_slice(&self.drpost.to_le_bytes());
+        payload.push(self.unknown2);
+        payload
+    }
+}
+
+#[derive(Debug)]
+pub struct SelectTap {
+    /// Usually 0x2000_0000
+    pub unknown1: u32,
+    pub irlen: u32,
+    pub irpost: u32,
+    pub drpre: u32,
+    pub drpost: u32,
+    /// This value is usually 0x43
+    pub unknown2: u8,
+    /// It's unclear what this value is, but it seems
+    /// to be an index (position from the TDI pin).
+    pub index: u8,
+}
+
+impl Xds110Command for SelectTap {
+    const COMMAND_ID: CommandId = CommandId::SelectTap;
+
+    type Response = GenericResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![];
+        payload.extend_from_slice(&self.unknown1.to_le_bytes());
+        payload.extend_from_slice(&self.irlen.to_le_bytes());
+        payload.extend_from_slice(&self.irpost.to_le_bytes());
+        payload.extend_from_slice(&self.drpre.to_le_bytes());
+        payload.extend_from_slice(&self.drpost.to_le_bytes());
+        payload.push(self.unknown2);
+        payload.push(self.index);
+        payload
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiConnect {}
+
+impl Xds110Command for CmapiConnect {
+    const COMMAND_ID: CommandId = CommandId::CmapiConnect;
+
+    type Response = CmapiConnectResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        vec![]
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiConnectResponse {
+    pub response: u32,
+    pub idcode: u32,
+}
+
+impl Xds110CommandResponse for CmapiConnectResponse {
+    fn from_payload(bytes: &[u8]) -> Result<Self, Xds110Error>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 8 {
+            return Err(Xds110Error::InvalidPayload);
+        }
+        Ok(CmapiConnectResponse {
+            response: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            idcode: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct SetAmbleDelay {
+    pub irpre: u32,
+    pub irpost: u32,
+    pub drpre: u32,
+    pub drpost: u32,
+}
+
+impl Xds110Command for SetAmbleDelay {
+    const COMMAND_ID: CommandId = CommandId::SetAmbleDelay;
+
+    type Response = GenericResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![];
+        payload.extend_from_slice(&self.irpre.to_le_bytes());
+        payload.extend_from_slice(&self.irpost.to_le_bytes());
+        payload.extend_from_slice(&self.drpre.to_le_bytes());
+        payload.extend_from_slice(&self.drpost.to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiDapRegWrite {
+    pub is_dp: u8,
+    pub is_ap: u8,
+    pub register: u8,
+    pub value: u32,
+}
+
+impl Xds110Command for CmapiDapRegWrite {
+    const COMMAND_ID: CommandId = CommandId::CmapiRegWrite;
+
+    type Response = GenericResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![self.is_dp, self.is_ap, self.register];
+        payload.extend_from_slice(&self.value.to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiDapRegRead {
+    pub is_dp: u8,
+    pub is_ap: u8,
+    pub register: u8,
+}
+
+impl Xds110Command for CmapiDapRegRead {
+    const COMMAND_ID: CommandId = CommandId::CmapiRegRead;
+
+    type Response = CmapiDapRegReadResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        vec![self.is_dp, self.is_ap, self.register]
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiDapRegReadResponse {
+    pub result: u32,
+    pub value: u32,
+}
+
+impl Xds110CommandResponse for CmapiDapRegReadResponse {
+    fn from_payload(bytes: &[u8]) -> Result<Self, Xds110Error>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 8 {
+            return Err(Xds110Error::NotEnoughBytesRead {
+                is: bytes.len(),
+                should: 8,
+            });
+        }
+        Ok(CmapiDapRegReadResponse {
+            result: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            value: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiMemRead {
+    pub unknown1: u8,
+    pub unknown2: u8,
+    pub unknown3: u8,
+    pub address: u32,
+    pub count: u16,
+    pub csw: u32,
+}
+
+impl Xds110Command for CmapiMemRead {
+    const COMMAND_ID: CommandId = CommandId::CmapiMemRead;
+
+    type Response = CmapiMemReadResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![self.unknown1, self.unknown2, self.unknown3];
+        payload.extend_from_slice(&self.address.to_le_bytes());
+        payload.extend_from_slice(&self.count.to_le_bytes());
+        payload.extend_from_slice(&self.csw.to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug)]
+pub struct CmapiMemReadResponse {
+    pub result: u32,
+    pub data: Vec<u8>,
+}
+
+impl Xds110CommandResponse for CmapiMemReadResponse {
+    fn from_payload(bytes: &[u8]) -> Result<Self, Xds110Error>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 4 {
+            return Err(Xds110Error::NotEnoughBytesRead {
+                is: bytes.len(),
+                should: 4,
+            });
+        }
+        Ok(CmapiMemReadResponse {
+            result: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            data: bytes[4..].to_vec(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct Armv7MemRead {
+    pub unknown1: u16,
+    pub unknown2: u16,
+    pub debug_unit_address: u32,
+    pub start: u32,
+    pub count: u32,
+}
+
+impl Xds110Command for Armv7MemRead {
+    const COMMAND_ID: CommandId = CommandId::Armv7MemRead;
+
+    type Response = Armv7MemReadResponse;
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = vec![];
+        payload.extend_from_slice(&self.unknown1.to_le_bytes());
+        payload.extend_from_slice(&self.unknown2.to_le_bytes());
+        payload.extend_from_slice(&self.debug_unit_address.to_le_bytes());
+        payload.extend_from_slice(&self.start.to_le_bytes());
+        payload.extend_from_slice(&self.count.to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug)]
+pub struct Armv7MemReadResponse {
+    pub result: u32,
+    pub data: Vec<u8>,
+}
+
+impl Xds110CommandResponse for Armv7MemReadResponse {
+    fn from_payload(bytes: &[u8]) -> Result<Self, Xds110Error>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 4 {
+            return Err(Xds110Error::NotEnoughBytesRead {
+                is: bytes.len(),
+                should: 4,
+            });
+        }
+        Ok(Armv7MemReadResponse {
+            result: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            data: bytes[4..].to_vec(),
+        })
     }
 }
