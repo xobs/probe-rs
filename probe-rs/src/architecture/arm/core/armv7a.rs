@@ -3,7 +3,8 @@
 use super::{
     CortexAState,
     instructions::aarch32::{
-        build_ldc, build_mcr, build_mov, build_mrc, build_mrs, build_stc, build_vmov, build_vmrs,
+        build_ldc, build_mcr, build_mov, build_mrc, build_mrs, build_msr, build_stc, build_vmov,
+        build_vmrs,
     },
     registers::{
         aarch32::{
@@ -242,8 +243,7 @@ impl<'probe> Armv7a<'probe> {
                         }
                         16 => {
                             // msr cpsr_fsxc, r0
-                            let instruction = 0xe12ff000;
-
+                            let instruction = build_msr(0);
                             self.execute_instruction_with_input(instruction, val.try_into()?)?;
                         }
                         17..=48 => {
