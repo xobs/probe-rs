@@ -82,12 +82,12 @@ impl ArmDebugSequence for TMS570 {
         }
 
         // TMS570 has ECC RAM. Ensure it's cleared to avoid cascading failures.
-        write_word_32(memory, base_address, 0xffff_ff5c, 0xau32)?;
-        write_word_32(memory, base_address, 0xffff_ff60, 1u32)?;
-        while read_word_32(memory, base_address, 0xffff_ff68)? & (1u32 << 8) == 0 {
+        write_word_32(memory, base_address, 0xffff_ff5c, 0xa)?;
+        write_word_32(memory, base_address, 0xffff_ff60, 1)?;
+        while read_word_32(memory, base_address, 0xffff_ff68)? & (1 << 8) == 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
-        write_word_32(memory, base_address, 0xffff_ff5c, 0x5u32)?;
+        write_word_32(memory, base_address, 0xffff_ff5c, 0x5)?;
 
         Ok(())
     }

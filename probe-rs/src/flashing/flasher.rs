@@ -316,6 +316,21 @@ impl Flasher {
         result
     }
 
+    pub(super) fn run_blank_check<'p, T, F>(
+        &mut self,
+        session: &mut Session,
+        progress: &FlashProgress<'p>,
+        f: F,
+    ) -> Result<T, FlashError>
+    where
+        F: FnOnce(&mut ActiveFlasher<'_, 'p, Erase>, &mut [LoadedRegion]) -> Result<T, FlashError>,
+    {
+        let (mut active, data) = self.init(session, progress, None)?;
+        let r = f(&mut active, data)?;
+        active.uninit()?;
+        Ok(r)
+    }
+
     pub(super) fn run_erase<'p, T, F>(
         &mut self,
         session: &mut Session,
@@ -905,11 +920,6 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             (regs.argument_register(1), registers.r1),
             (regs.argument_register(2), registers.r2),
             (regs.argument_register(3), registers.r3),
-            (regs.core_register(7), Some(0x87654312)),
-            (regs.core_register(8), Some(0xabcdef01)),
-            (regs.core_register(10), Some(0x99887766)),
-            (regs.core_register(11), Some(0x55667788)),
-            (regs.core_register(12), Some(0xa1b2c3d4)),
             (
                 regs.core_register(9),
                 if init {
@@ -1256,6 +1266,63 @@ impl ActiveFlasher<'_, '_, Erase> {
             })
         } else {
             self.progress.sector_erased(sector.size(), t1.elapsed());
+            Ok(())
+        }
+    }
+
+    pub(super) fn blank_check(&mut self, sector: &FlashSector) -> Result<(), FlashError> {
+        let address = sector.address();
+        let size = sector.size();
+        tracing::info!(
+            "Checking for blanked flash between address {:#010x} and {:#010x}",
+            address,
+            address + size
+        );
+        let t1 = Instant::now();
+
+        if let Some(blank_check) = self.flash_algorithm.pc_blank_check {
+            let error_code = self.call_function_and_wait(
+                &Registers {
+                    pc: into_reg(blank_check)?,
+                    r0: Some(into_reg(address)?),
+                    r1: Some(into_reg(size)?),
+                    r2: None,
+                    r3: None,
+                },
+                false,
+                Duration::from_millis(
+                    // self.flash_algorithm.flash_properties.erase_sector_timeout as u64,
+                    10_000,
+                ),
+            )?;
+            tracing::info!(
+                "Done checking blank. Result is {}. This took {:?}",
+                error_code,
+                t1.elapsed()
+            );
+
+            if error_code != 0 {
+                Err(FlashError::RoutineCallFailed {
+                    name: "blank_check",
+                    error_code,
+                })
+            } else {
+                self.progress.sector_erased(sector.size(), t1.elapsed());
+                Ok(())
+            }
+        } else {
+            let mut data = vec![0; size as usize];
+            self.core
+                .read(address, &mut data)
+                .map_err(FlashError::Core)?;
+            if !data
+                .iter()
+                .all(|v| *v == self.flash_algorithm.flash_properties.erased_byte_value)
+            {
+                return Err(FlashError::ChipEraseFailed {
+                    source: "Not all sectors were erased".into(),
+                });
+            }
             Ok(())
         }
     }

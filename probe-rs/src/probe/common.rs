@@ -556,14 +556,6 @@ impl<Probe: RawJtagIo + 'static> JtagAccess for Probe {
     }
 
     fn set_scan_chain(&mut self, scan_chain: &[ScanChainElement]) -> Result<(), DebugProbeError> {
-        if let Some(existing) = &self.state().expected_scan_chain {
-            panic!(
-                "Set scan chain to {:?} -- the existing scan chain was {:?}",
-                scan_chain, existing
-            );
-        } else {
-            println!("Setting new expected scan chain to {:?}", scan_chain);
-        }
         self.state_mut().expected_scan_chain = Some(scan_chain.to_vec());
         Ok(())
     }

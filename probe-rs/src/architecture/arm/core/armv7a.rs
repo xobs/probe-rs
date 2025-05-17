@@ -284,7 +284,7 @@ impl<'probe> Armv7a<'probe> {
         &mut self,
         op: impl FnOnce(&mut Self) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let was_running = !self.core_halted()?;
+        let was_running = !(self.state.current_state.is_halted() || self.core_halted()?);
 
         if was_running {
             self.halt(Duration::from_millis(100))?;
