@@ -214,7 +214,7 @@ pub fn cmd_test(
     let mut readback = vec![0; data_size as usize];
     session
         .core(0)?
-        .read_8(test_start_sector_address + 1, &mut readback)?;
+        .read(test_start_sector_address + 1, &mut readback)?;
     assert_eq!(readback, data);
 
     println!("{test}: Erasing the entire chip and writing two pages ...");

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! XDS110 probe support.
 //!
 //! The protocol is mostly undocumented, though openocd does have support.

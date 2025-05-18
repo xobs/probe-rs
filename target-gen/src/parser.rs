@@ -77,6 +77,13 @@ pub fn extract_flash_algo(
     let algorithm_binary = crate::algorithm_binary::AlgorithmBinary::new(&elf, buffer)?;
     algo.instructions = algorithm_binary.blob();
 
+    // Flash algorithms are all little endian. Swap the algorithm if necessary.
+    if !elf.little_endian {
+        for instruction in algo.instructions.chunks_exact_mut(4) {
+            instruction.reverse();
+        }
+    }
+
     let code_section_offset = algorithm_binary.code_section.start;
 
     // Extract the function pointers,
@@ -126,7 +133,6 @@ pub fn extract_flash_algo(
     algo.default = default;
     algo.data_section_offset = algorithm_binary.data_section.start as u64;
     algo.flash_properties = FlashProperties::from(flash_device);
-    algo.big_endian = !elf.little_endian;
 
     Ok(algo)
 }

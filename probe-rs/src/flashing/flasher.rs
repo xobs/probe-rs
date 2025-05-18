@@ -1,5 +1,6 @@
 use probe_rs_target::{RawFlashAlgorithm, TransferEncoding};
 use tracing::Level;
+use zerocopy::IntoBytes;
 
 use super::{FlashAlgorithm, FlashBuilder, FlashError, FlashPage, FlashProgress};
 use crate::config::NvmRegion;
@@ -1185,7 +1186,7 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
         let t1 = Instant::now();
 
         self.core
-            .write_32(address, &words)
+            .write(address, words.as_bytes())
             .map_err(FlashError::Core)?;
 
         tracing::info!(

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! XDS110 commands
 
 use crate::probe::common::{JtagState, RegisterState};

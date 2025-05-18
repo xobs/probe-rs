@@ -9,7 +9,7 @@ use crate::probe::DebugProbeError;
 /// The overarching error type which contains all possible errors as variants.
 #[derive(thiserror::Error, Debug, docsplay::Display)]
 pub enum Error {
-    /// An error with the usage of the probe occurred
+    /// An error with the usage of the probe occurred: {0}
     Probe(#[from] DebugProbeError),
     /// An ARM specific error occurred: {0}
     Arm(#[source] ArmError),

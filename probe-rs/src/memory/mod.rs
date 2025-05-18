@@ -152,6 +152,7 @@ where
     ///
     ///  Generally faster than `read_8`.
     fn read(&mut self, address: u64, data: &mut [u8]) -> Result<(), ERR> {
+        tracing::trace!("Default read() implementation");
         if self.supports_native_64bit_access() {
             // Avoid heap allocation and copy if we don't need it.
             self.read_8(address, data)?;
@@ -398,6 +399,10 @@ where
 
     fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), Error> {
         self.memory_mut().read_8(address, data).map_err(Error::from)
+    }
+
+    fn read(&mut self, address: u64, data: &mut [u8]) -> Result<(), Error> {
+        self.memory_mut().read(address, data).map_err(Error::from)
     }
 
     fn write_word_64(&mut self, address: u64, data: u64) -> Result<(), Error> {

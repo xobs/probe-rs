@@ -53,7 +53,7 @@ use std::ops::Range;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// The RTT interface.
 ///
@@ -168,18 +168,14 @@ impl RttControlBlockHeader {
 
     pub fn max_up_channels(&self) -> usize {
         match self {
-            RttControlBlockHeader::Header32(x) => {
-                u32::from(u32::from_be(x.max_up_channels)) as usize
-            }
+            RttControlBlockHeader::Header32(x) => x.max_up_channels as usize,
             RttControlBlockHeader::Header64(x) => x.max_up_channels as usize,
         }
     }
 
     pub fn max_down_channels(&self) -> usize {
         match self {
-            RttControlBlockHeader::Header32(x) => {
-                u32::from(u32::from_be(x.max_down_channels)) as usize
-            }
+            RttControlBlockHeader::Header32(x) => x.max_down_channels as usize,
             RttControlBlockHeader::Header64(x) => x.max_down_channels as usize,
         }
     }
@@ -236,7 +232,10 @@ impl RttControlBlockHeader {
 // }
 impl Rtt {
     /// The magic string expected to be found at the beginning of the RTT control block.
-    pub const RTT_ID: [u8; 16] = *b"SEGGER RTT\0\0\0\0\0\0";
+    pub const RTT_ID_LE: [u8; 16] = *b"SEGGER RTT\0\0\0\0\0\0";
+
+    /// The magic string expected to be found at the beginning of the RTT control block in big endian
+    pub const RTT_ID_BE: [u8; 16] = *b"GGESR RE\0\0TT\0\0\0\0";
 
     /// Tries to attach to an RTT control block at the specified memory address.
     pub fn attach_at(
@@ -246,22 +245,23 @@ impl Rtt {
     ) -> Result<Rtt, Error> {
         let is_64_bit = core.is_64_bit();
 
-        let mut mem = [0u8; RttControlBlockHeader::minimal_header_size(true)];
-        core.read(ptr, &mut mem)?;
+        let mut mem = [0u32; RttControlBlockHeader::minimal_header_size(true) / 4];
+        core.read_32(ptr, &mut mem)?;
 
-        let rtt_header = RttControlBlockHeader::try_from_header(is_64_bit, &mem)
+        let rtt_header = RttControlBlockHeader::try_from_header(is_64_bit, mem.as_bytes())
             .ok_or(Error::ControlBlockNotFound)?;
 
         // Validate that the control block starts with the ID bytes
         let rtt_id = rtt_header.id();
-        if rtt_id != Self::RTT_ID {
+        if rtt_id != Self::RTT_ID_LE && rtt_id != Self::RTT_ID_BE {
             tracing::trace!(
                 "Expected control block to start with RTT ID: {:?}\n. Got instead: {:?}",
-                String::from_utf8_lossy(&Self::RTT_ID),
+                String::from_utf8_lossy(&Self::RTT_ID_LE),
                 String::from_utf8_lossy(&rtt_id)
             );
             return Err(Error::ControlBlockNotFound);
         }
+        tracing::trace!("Found control block");
 
         let max_up_channels = rtt_header.max_up_channels();
         let max_down_channels = rtt_header.max_down_channels();
@@ -275,8 +275,12 @@ impl Rtt {
 
         // Read the rest of the control block
         let channel_buffer_len = rtt_header.total_rtt_buffer_size() - rtt_header.header_size();
-        let mut mem = vec![0; channel_buffer_len];
-        core.read(ptr + rtt_header.header_size() as u64, &mut mem)?;
+        let mut mem = vec![0; channel_buffer_len / 4];
+        tracing::trace!(
+            "Reading header consisting of {} bytes of channel buffer data...",
+            channel_buffer_len
+        );
+        core.read_32(ptr + rtt_header.header_size() as u64, &mut mem)?;
 
         let mut up_channels = Vec::new();
         let mut down_channels = Vec::new();
@@ -285,12 +289,14 @@ impl Rtt {
 
         let up_channels_start = 0;
         let up_channels_len = max_up_channels * channel_buffer_size;
-        let up_channels_raw_buffer = &mem[up_channels_start..][..up_channels_len];
+        let up_channels_raw_buffer = &mem.as_bytes()[up_channels_start..][..up_channels_len];
+        tracing::trace!("Parsing up channel buffers...");
         let up_channels_buffer = rtt_header.parse_channel_buffers(up_channels_raw_buffer)?;
 
         let down_channels_start = up_channels_start + up_channels_len;
         let down_channels_len = max_down_channels * channel_buffer_size;
-        let down_channels_raw_buffer = &mem[down_channels_start..][..down_channels_len];
+        let down_channels_raw_buffer = &mem.as_bytes()[down_channels_start..][..down_channels_len];
+        tracing::trace!("Parsing down channel buffers...");
         let down_channels_buffer = rtt_header.parse_channel_buffers(down_channels_raw_buffer)?;
 
         let mut offset = ptr + rtt_header.header_size() as u64 + up_channels_start as u64;
@@ -384,8 +390,8 @@ impl Rtt {
                 core.read(range.start, &mut mem).ok()?;
 
                 let offset = mem
-                    .windows(Self::RTT_ID.len())
-                    .position(|w| w == Self::RTT_ID)?;
+                    .windows(Self::RTT_ID_LE.len())
+                    .position(|w| w == Self::RTT_ID_LE)?;
 
                 let target_ptr = range.start + offset as u64;
 
@@ -482,13 +488,13 @@ pub enum Error {
     /// Attempted an RTT operation against a Core number that is different from the Core number against which RTT was initialized. Expected {0}, found {1}
     IncorrectCoreSpecified(usize, usize),
 
-    /// Error communicating with the probe.
+    /// Error communicating with the probe: {0}
     Probe(#[from] crate::Error),
 
     /// Unexpected error while reading {0} from target memory. Please report this as a bug.
     MemoryRead(String),
 
-    /// Some uncategorized error occurred.
+    /// Some uncategorized error occurred: {0}
     Other(#[from] anyhow::Error),
 
     /// The read pointer changed unexpectedly.
@@ -516,10 +522,10 @@ fn try_attach_to_rtt_inner(
 
         match try_attach_once() {
             err @ Err(Error::NoControlBlockLocation) => return err,
-            Err(_) if t.elapsed() < timeout => {
+            Err(e) if t.elapsed() < timeout => {
                 attempt += 1;
-                tracing::debug!("Failed to initialize RTT. Retrying until timeout.");
-                thread::sleep(Duration::from_millis(250));
+                tracing::debug!("Failed to initialize RTT: {}. Retrying until timeout.", e);
+                thread::sleep(Duration::from_millis(50));
             }
             other => return other,
         }
