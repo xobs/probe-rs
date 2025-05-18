@@ -1,4 +1,9 @@
-//! Sequences for tms570 devices
+//! Sequences for TMS570 devices
+//!
+//! The sequence used for catching a reset from Section 3 of the document
+//! [JTAG Programmer Overview for Hercules-based Microcontrollers](https://www.ti.com/lit/an/spna230/spna230.pdf),
+//! and largely involves creating a breakpoint, issuing some sort of reset,
+//! then clearing memory using platform-specific register writes.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -15,7 +20,11 @@ use crate::probe::WireProtocol;
 
 use super::icepick::Icepick;
 
+/// The TMS570 is at index 0 in the TAP chain
 const TMS570_TAP_INDEX: u8 = 0;
+
+/// How long to wait for the core to halt.
+const HALT_DELAY: Duration = Duration::from_millis(100);
 
 /// Marker struct indicating initialization sequencing for cc13xx_cc26xx family parts.
 #[derive(Debug)]
@@ -43,9 +52,14 @@ impl ArmDebugSequence for TMS570 {
         debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
         let base_address = debug_base.ok_or(ArmError::NoArmTarget)?;
-        request_halt(memory, base_address)?;
-        wait_for_core_halted(memory, base_address, Duration::from_millis(100))?;
 
+        // Halt the core. Note that this bypasses any sort of register cache,
+        // and doesn't update the status within the ARMv7A.
+        request_halt(memory, base_address)?;
+        wait_for_core_halted(memory, base_address, HALT_DELAY)?;
+
+        // If there is an existing breakpoint at address 0, note that down before
+        // replacing it with our own breakpoint.
         let existing = get_hw_breakpoint(memory, base_address, 0)?;
         if let Some(existing) = existing {
             self.existing_breakpoint.store(existing, Ordering::Release);
@@ -67,8 +81,11 @@ impl ArmDebugSequence for TMS570 {
         debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
         let base_address = debug_base.ok_or(ArmError::NoArmTarget)?;
+
+        // Halt the core. Note that this bypasses any sort of register cache,
+        // and doesn't update the status within the ARMv7A.
         request_halt(memory, base_address)?;
-        wait_for_core_halted(memory, base_address, Duration::from_millis(100))?;
+        wait_for_core_halted(memory, base_address, HALT_DELAY)?;
 
         if self.breakpoint_active.swap(false, Ordering::Release) {
             set_hw_breakpoint(
@@ -81,7 +98,8 @@ impl ArmDebugSequence for TMS570 {
             clear_hw_breakpoint(memory, base_address, 0)?;
         }
 
-        // TMS570 has ECC RAM. Ensure it's cleared to avoid cascading failures.
+        // TMS570 has ECC RAM. Ensure it's cleared to avoid cascading failures. Without
+        // this, writes to SRAM will trap, preventing execution from RAM.
         write_word_32(memory, base_address, 0xffff_ff5c, 0xa)?;
         write_word_32(memory, base_address, 0xffff_ff60, 1)?;
         while read_word_32(memory, base_address, 0xffff_ff68)? & (1 << 8) == 0 {
@@ -112,7 +130,6 @@ impl ArmDebugSequence for TMS570 {
         interface: &mut dyn DapProbe,
         _dp: DpAddress,
     ) -> Result<(), ArmError> {
-        tracing::trace!("Configuring TMS570...");
         // Ensure current debug interface is in reset state.
         interface.swj_sequence(51, 0x0007_FFFF_FFFF_FFFF)?;
 
@@ -141,8 +158,6 @@ impl ArmDebugSequence for TMS570 {
                 .into());
             }
         }
-
-        tracing::info!("TMS570 configured");
 
         Ok(())
     }
