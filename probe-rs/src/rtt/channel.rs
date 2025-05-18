@@ -1,6 +1,6 @@
 use crate::rtt::Error;
-use crate::{Core, MemoryInterface};
-use probe_rs_target::RegionMergeIterator;
+use crate::{Core, CoreInterface, MemoryInterface};
+use probe_rs_target::{Endian, RegionMergeIterator};
 use std::cmp::min;
 use std::ffi::CStr;
 use std::num::NonZeroU64;
@@ -17,6 +17,20 @@ pub trait RttChannel {
     /// Returns the buffer size in bytes. Note that the usable size is one byte less due to how the
     /// ring buffer is implemented.
     fn buffer_size(&self) -> usize;
+}
+
+fn le_to_core(core: &mut Core, val: u32) -> Result<u32, Error> {
+    Ok(match core.endianness()? {
+        Endian::Little => val.to_le(),
+        Endian::Big => val.to_be(),
+    })
+}
+
+fn core_to_le(core: &mut Core, val: u32) -> Result<u32, Error> {
+    Ok(match core.endianness()? {
+        Endian::Little => u32::from_le(val),
+        Endian::Big => u32::from_be(val),
+    })
 }
 
 #[repr(C)]

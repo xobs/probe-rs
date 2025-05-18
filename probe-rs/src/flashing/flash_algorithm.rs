@@ -180,7 +180,7 @@ impl FlashAlgorithm {
     // Header for RISC-V Flash Algorithms
     const RISCV_FLASH_BLOB_HEADER: [u32; 2] = [riscv::assembly::EBREAK, riscv::assembly::EBREAK];
 
-    const ARM_FLASH_BLOB_HEADER: [u32; 1] = [arm::assembly::BRKPT.to_be()];
+    const ARM_FLASH_BLOB_HEADER: [u32; 1] = [arm::assembly::BRKPT];
 
     const XTENSA_FLASH_BLOB_HEADER: [u32; 0] = [];
 
@@ -250,7 +250,13 @@ impl FlashAlgorithm {
             None
         };
 
-        let header = Self::algorithm_header(target.architecture());
+        let mut header = Self::algorithm_header(target.architecture()).to_vec();
+        if raw.big_endian {
+            for word in header.iter_mut() {
+                *word = word.swap_bytes();
+            }
+        }
+
         let instructions: Vec<u32> = header
             .iter()
             .copied()
@@ -260,7 +266,7 @@ impl FlashAlgorithm {
             .chain(last_elem)
             .collect();
 
-        let header_size = size_of_val(header) as u64;
+        let header_size = size_of_val(header.as_slice()) as u64;
 
         // The start address where we try to load the flash algorithm.
         let addr_load = match raw.load_address {

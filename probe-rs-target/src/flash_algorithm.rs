@@ -97,6 +97,10 @@ pub struct RawFlashAlgorithm {
     /// The encoding format accepted by the flash algorithm.
     #[serde(default)]
     pub transfer_encoding: Option<TransferEncoding>,
+
+    /// Whether this file is big endian
+    #[serde(default)]
+    pub big_endian: bool,
 }
 
 impl RawFlashAlgorithm {
