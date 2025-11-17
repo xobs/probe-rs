@@ -73,8 +73,8 @@ impl<'a> RuntimeTarget<'a> {
         cores: Vec<usize>,
         addrs: &[SocketAddr],
     ) -> Result<Self, anyhow::Error> {
-        let listener = TcpListener::bind(addrs)?;
-        listener.set_nonblocking(true)?;
+        let listener = TcpListener::bind(addrs).expect("breakage");
+        listener.set_nonblocking(true).expect("breakage");
 
         Ok(Self {
             session,
@@ -109,14 +109,15 @@ impl<'a> RuntimeTarget<'a> {
 
             // When we first attach to the core, GDB expects us to halt the core,
             // so we do this here when a new client connects.
-            self.halt_all_cores()?;
-            self.load_target_desc()?;
+            self.halt_all_cores().expect("breakage");
+            self.load_target_desc().expect("breakage");
 
             // Start the GDB Stub state machine
             // Any errors at this state are either IO errors or fatal config errors
             let state_machine = GdbStub::new(stream)
                 .run_state_machine(self)
-                .map_err(|e| anyhow::anyhow!(e))?;
+                .map_err(|e| anyhow::anyhow!(e))
+                .expect("breakage");
 
             self.gdb = Some(state_machine);
         }
@@ -129,9 +130,15 @@ impl<'a> RuntimeTarget<'a> {
         let mut wait_time = Duration::ZERO;
 
         self.gdb = match gdb {
-            GdbStubStateMachine::Idle(state) => self.handle_idle(state, &mut wait_time)?,
-            GdbStubStateMachine::Running(state) => self.handle_running(state, &mut wait_time)?,
-            GdbStubStateMachine::CtrlCInterrupt(state) => self.handle_ctrl_c(state)?,
+            GdbStubStateMachine::Idle(state) => {
+                self.handle_idle(state, &mut wait_time).expect("breakage")
+            }
+            GdbStubStateMachine::Running(state) => self
+                .handle_running(state, &mut wait_time)
+                .expect("breakage"),
+            GdbStubStateMachine::CtrlCInterrupt(state) => {
+                self.handle_ctrl_c(state).expect("breakage")
+            }
             GdbStubStateMachine::Disconnected(state) => {
                 tracing::info!("GDB client disconnected: {:?}", state.get_reason());
 
@@ -146,9 +153,11 @@ impl<'a> RuntimeTarget<'a> {
         let mut session = self.session.lock();
 
         for i in &self.cores {
-            let mut core = session.core(*i)?;
-            if !core.core_halted()? {
-                core.halt(Duration::from_millis(100))?;
+            let Ok(mut core) = session.core(*i) else {
+                continue;
+            };
+            if !core.core_halted().expect("breakage") {
+                core.halt(Duration::from_millis(100)).expect("breakage");
             }
         }
 
@@ -163,11 +172,11 @@ impl<'a> RuntimeTarget<'a> {
         let next_byte = {
             let conn = state.borrow_conn();
 
-            read_if_available(conn)?
+            read_if_available(conn).expect("breakage")
         };
 
         let next_state = if let Some(b) = next_byte {
-            state.incoming_data(self, b)?
+            state.incoming_data(self, b).expect("breakage")
         } else {
             *wait_time = Duration::from_millis(10);
             state.into()
@@ -184,11 +193,11 @@ impl<'a> RuntimeTarget<'a> {
         let next_byte = {
             let conn = state.borrow_conn();
 
-            read_if_available(conn)?
+            read_if_available(conn).expect("breakage")
         };
 
         if let Some(b) = next_byte {
-            return Ok(Some(state.incoming_data(self, b)?));
+            return Ok(Some(state.incoming_data(self, b).expect("breakage")));
         }
 
         // Check for break
@@ -197,8 +206,10 @@ impl<'a> RuntimeTarget<'a> {
             let mut session = self.session.lock();
 
             for i in &self.cores {
-                let mut core = session.core(*i)?;
-                let CoreStatus::Halted(reason) = core.status()? else {
+                let Ok(mut core) = session.core(*i) else {
+                    continue;
+                };
+                let CoreStatus::Halted(reason) = core.status().expect("breakage") else {
                     continue;
                 };
 
@@ -224,8 +235,8 @@ impl<'a> RuntimeTarget<'a> {
         let next_state = if let Some(reason) = stop_reason {
             // Halt all remaining cores that are still running.
             // GDB expects all or nothing stops.
-            self.halt_all_cores()?;
-            state.report_stop(self, reason)?
+            self.halt_all_cores().expect("breakage");
+            state.report_stop(self, reason).expect("breakage")
         } else {
             *wait_time = Duration::from_millis(10);
             state.into()
@@ -238,9 +249,10 @@ impl<'a> RuntimeTarget<'a> {
         &mut self,
         state: GdbStubStateMachineInner<'b, state::CtrlCInterrupt, Self, TcpStream>,
     ) -> Result<Option<GdbStubStateMachine<'b, Self, TcpStream>>, anyhow::Error> {
-        self.halt_all_cores()?;
-        let next_state =
-            state.interrupt_handled(self, Some(MultiThreadStopReason::Signal(Signal::SIGINT)))?;
+        self.halt_all_cores().expect("breakage");
+        let next_state = state
+            .interrupt_handled(self, Some(MultiThreadStopReason::Signal(Signal::SIGINT)))
+            .expect("breakage");
 
         Ok(Some(next_state))
     }

@@ -48,12 +48,17 @@ pub struct Cmd {
 
 impl Cmd {
     pub fn run(self, registry: &mut Registry, lister: &Lister) -> anyhow::Result<()> {
-        let (mut session, _probe_options) = self.common.simple_attach(registry, lister)?;
+        let (mut session, _probe_options) = self
+            .common
+            .simple_attach(registry, lister)
+            .expect("breakage");
 
         if self.reset_halt {
             session
-                .core(0)?
-                .reset_and_halt(Duration::from_millis(100))?;
+                .core(0)
+                .expect("breakage")
+                .reset_and_halt(Duration::from_millis(100))
+                .expect("breakage");
         }
 
         let gdb_connection_string = self
@@ -91,7 +96,7 @@ impl Cmd {
             }
             cmd.args(self.gdb_args);
             eprintln!("Spawning {cmd:?}");
-            Some(cmd.spawn()?)
+            Some(cmd.spawn().expect("breakage"))
         } else {
             None
         };

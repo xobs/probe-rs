@@ -92,7 +92,8 @@ pub fn run<'a>(
         .map(|instance| {
             target::RuntimeTarget::new(session, instance.cores.to_vec(), &instance.socket_addrs[..])
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .expect("breakage");
 
     // Avoid getting stuck in an infinite loop if we have no targets
     if targets.is_empty() {
@@ -103,7 +104,7 @@ pub fn run<'a>(
     loop {
         // Check if the gdb we spawned has exited and if so exit outself.
         if let Some(gdb_process) = &mut gdb_process
-            && let Some(exit_status) = gdb_process.try_wait()?
+            && let Some(exit_status) = gdb_process.try_wait().expect("breakage")
         {
             if !exit_status.success() {
                 bail!("Gdb failed with {exit_status}");
@@ -114,7 +115,7 @@ pub fn run<'a>(
         let mut wait_time = Duration::MAX;
 
         for target in targets.iter_mut() {
-            wait_time = wait_time.min(target.process()?);
+            wait_time = wait_time.min(target.process().expect("breakage"));
         }
 
         // Wait until we were asked to check again

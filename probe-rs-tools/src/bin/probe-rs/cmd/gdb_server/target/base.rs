@@ -14,18 +14,31 @@ use probe_rs::{Core, Error, MemoryInterface};
 impl MultiThreadBase for RuntimeTarget<'_> {
     fn read_registers(&mut self, regs: &mut RuntimeRegisters, tid: Tid) -> TargetResult<(), Self> {
         let mut session = self.session.lock();
-        let mut core = session.core(tid.get() - 1).into_target_result()?;
+        let Ok(mut core) = session
+            .core(tid.get() - 1)
+            .inspect_err(|e| tracing::error!("Unable to get core {}: {e}", tid.get() - 1))
+        else {
+            let mut reg_buffer = Vec::<u8>::new();
+            for reg in self.target_desc.get_registers_for_main_group() {
+                for _ in 0..reg.size_in_bytes() {
+                    reg_buffer.push(0);
+                }
+            }
+            regs.regs = reg_buffer;
+            return Ok(());
+        };
 
-        regs.pc = core
-            .read_core_reg(core.program_counter())
-            .into_target_result()?;
+        regs.pc = core.read_core_reg(core.program_counter()).unwrap();
 
         let mut reg_buffer = Vec::<u8>::new();
 
         for reg in self.target_desc.get_registers_for_main_group() {
             let bytesize = reg.size_in_bytes();
-            let mut value: u128 =
-                read_register_from_source(&mut core, reg.source()).into_target_result()?;
+            let mut value: u128 = read_register_from_source(&mut core, reg.source())
+                .inspect_err(|e| {
+                    tracing::error!("Unable to read register {:x?}: {e}", reg.source())
+                })
+                .unwrap_or_default();
 
             for _ in 0..bytesize {
                 reg_buffer.push(value as u8);
@@ -40,10 +53,10 @@ impl MultiThreadBase for RuntimeTarget<'_> {
 
     fn write_registers(&mut self, regs: &RuntimeRegisters, tid: Tid) -> TargetResult<(), Self> {
         let mut session = self.session.lock();
-        let mut core = session.core(tid.get() - 1).into_target_result()?;
+        let mut core = session.core(tid.get() - 1).unwrap();
 
         core.write_core_reg(core.program_counter(), regs.pc)
-            .into_target_result()?;
+            .unwrap();
 
         let mut current_regval_offset = 0;
 
@@ -68,7 +81,7 @@ impl MultiThreadBase for RuntimeTarget<'_> {
                 value += (*ch as u128) << (8 * exp);
             }
 
-            write_register_from_source(&mut core, reg.source(), value).into_target_result()?;
+            write_register_from_source(&mut core, reg.source(), value).expect("breakage");
 
             current_regval_offset = current_regval_end;
 
@@ -93,7 +106,7 @@ impl MultiThreadBase for RuntimeTarget<'_> {
             return Err(TargetError::Errno(14));
         }
         let mut session = self.session.lock();
-        let mut core = session.core(tid.get() - 1).into_target_result()?;
+        let mut core = session.core(tid.get() - 1).unwrap();
 
         // We currently either read the entire buffer or nothing
         let num_read = data.len();
@@ -105,7 +118,7 @@ impl MultiThreadBase for RuntimeTarget<'_> {
 
     fn write_addrs(&mut self, start_addr: u64, data: &[u8], tid: Tid) -> TargetResult<(), Self> {
         let mut session = self.session.lock();
-        let mut core = session.core(tid.get() - 1).into_target_result()?;
+        let mut core = session.core(tid.get() - 1).unwrap();
 
         core.write_8(start_addr, data)
             .into_target_result_non_fatal()
@@ -145,13 +158,12 @@ impl SingleRegisterAccess<Tid> for RuntimeTarget<'_> {
         buf: &mut [u8],
     ) -> TargetResult<usize, Self> {
         let mut session = self.session.lock();
-        let mut core = session.core(tid.get() - 1).into_target_result()?;
+        let mut core = session.core(tid.get() - 1).unwrap();
 
         let reg = self.target_desc.get_register(reg_id.into());
         let bytesize = reg.size_in_bytes();
 
-        let mut value: u128 =
-            read_register_from_source(&mut core, reg.source()).into_target_result()?;
+        let mut value: u128 = read_register_from_source(&mut core, reg.source()).unwrap();
 
         for buf_entry in buf.iter_mut().take(bytesize) {
             *buf_entry = value as u8;
@@ -168,7 +180,7 @@ impl SingleRegisterAccess<Tid> for RuntimeTarget<'_> {
         val: &[u8],
     ) -> TargetResult<(), Self> {
         let mut session = self.session.lock();
-        let mut core = session.core(tid.get() - 1).into_target_result()?;
+        let mut core = session.core(tid.get() - 1).unwrap();
 
         let reg = self.target_desc.get_register(reg_id.into());
         let bytesize = reg.size_in_bytes();
@@ -179,7 +191,7 @@ impl SingleRegisterAccess<Tid> for RuntimeTarget<'_> {
             value += (*ch as u128) << (8 * exp);
         }
 
-        write_register_from_source(&mut core, reg.source(), value).into_target_result()?;
+        write_register_from_source(&mut core, reg.source(), value).unwrap();
 
         Ok(())
     }
@@ -188,7 +200,10 @@ impl SingleRegisterAccess<Tid> for RuntimeTarget<'_> {
 fn read_register_from_source(core: &mut Core, source: GdbRegisterSource) -> Result<u128, Error> {
     match source {
         GdbRegisterSource::SingleRegister(id) => {
-            let val: u128 = core.read_core_reg(id)?;
+            let val: u128 = core
+                .read_core_reg(id)
+                .inspect_err(|e| tracing::error!("Unable to read 32-bit register {:?}: {e}", id))
+                .unwrap_or_default();
 
             Ok(val)
         }
@@ -197,8 +212,24 @@ fn read_register_from_source(core: &mut Core, source: GdbRegisterSource) -> Resu
             high,
             word_size,
         } => {
-            let mut val: u128 = core.read_core_reg(low)?;
-            let high_val: u128 = core.read_core_reg(high)?;
+            let mut val: u128 = core
+                .read_core_reg(low)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Unable to read low value for 64-bit register {:?}: {e}",
+                        low
+                    )
+                })
+                .unwrap_or_default();
+            let high_val: u128 = core
+                .read_core_reg(high)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Unable to read high value for 64-bit register {:?}: {e}",
+                        high
+                    )
+                })
+                .unwrap_or_default();
 
             val |= high_val << word_size;
 
@@ -222,7 +253,7 @@ fn write_register_from_source(
             let low_word = value & ((1 << word_size) - 1);
             let high_word = value >> word_size;
 
-            core.write_core_reg(low, low_word)?;
+            core.write_core_reg(low, low_word).expect("breakage");
             core.write_core_reg(high, high_word)
         }
     }

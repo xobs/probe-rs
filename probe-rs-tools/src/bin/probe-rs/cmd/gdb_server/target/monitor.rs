@@ -23,7 +23,7 @@ impl MonitorCmd for RuntimeTarget<'_> {
             b"info" => outputln!(out, "Target info:\n\n{:#?}", self.session.lock().target()),
             b"reset" => {
                 outputln!(out, "Resetting target");
-                match self.session.lock().core(0)?.reset() {
+                match self.session.lock().core(0).unwrap().reset() {
                     Ok(_) => outputln!(out, "Done"),
                     Err(e) => outputln!(out, "Error while resetting target:\n\t{}", e),
                 }
@@ -31,7 +31,7 @@ impl MonitorCmd for RuntimeTarget<'_> {
             b"reset halt" => {
                 let timeout = Duration::from_secs(1);
                 outputln!(out, "Resetting and halting target");
-                match self.session.lock().core(0)?.reset_and_halt(timeout) {
+                match self.session.lock().core(0).unwrap().reset_and_halt(timeout) {
                     Ok(_) => outputln!(out, "Target halted"),
                     Err(e) => outputln!(out, "Error while halting target:\n\t{}", e),
                 }

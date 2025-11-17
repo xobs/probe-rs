@@ -10,13 +10,15 @@ impl MultiThreadResume for RuntimeTarget<'_> {
         match self.resume_action {
             (_, ResumeAction::Resume) => {
                 for core_id in self.cores.iter() {
-                    let mut core = session.core(*core_id)?;
-                    core.run()?;
+                    let Ok(mut core) = session.core(*core_id) else {
+                        continue;
+                    };
+                    core.run().expect("breakage");
                 }
             }
             (core_id, ResumeAction::Step) => {
-                let mut core = session.core(core_id)?;
-                core.step()?;
+                let mut core = session.core(core_id).unwrap();
+                core.step().expect("breakage");
             }
             (_, ResumeAction::Unchanged) => {}
         }

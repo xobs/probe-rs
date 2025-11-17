@@ -30,9 +30,11 @@ impl HwBreakpoint for RuntimeTarget<'_> {
         let mut session = self.session.lock();
 
         for core_id in &self.cores {
-            let mut core = session.core(*core_id).into_target_result()?;
+            let Ok(mut core) = session.core(*core_id) else {
+                continue;
+            };
 
-            core.set_hw_breakpoint(addr).into_target_result()?;
+            core.set_hw_breakpoint(addr).expect("breakage");
         }
 
         Ok(true)
@@ -46,9 +48,11 @@ impl HwBreakpoint for RuntimeTarget<'_> {
         let mut session = self.session.lock();
 
         for core_id in &self.cores {
-            let mut core = session.core(*core_id).into_target_result()?;
+            let Ok(mut core) = session.core(*core_id) else {
+                continue;
+            };
 
-            core.clear_hw_breakpoint(addr).into_target_result()?;
+            core.clear_hw_breakpoint(addr).expect("breakage");
         }
 
         Ok(true)
