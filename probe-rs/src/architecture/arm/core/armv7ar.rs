@@ -52,24 +52,47 @@ struct BankedAccess<'a> {
     itr: u64,
     dscr: u64,
     dtrrx: u64,
+    /// The TAR writes that point the banked window at the debug registers, until one batch
+    /// carrying them has gone through.
+    window: Vec<(u64, Option<u32>)>,
 }
 
 impl<'a> BankedAccess<'a> {
+    /// Run `accesses`, behind the writes that set up the banked window if they have not gone
+    /// through yet, so that setting it up costs no transaction of its own.
+    fn access(
+        &mut self,
+        accesses: &[(u64, Option<u32>)],
+        values: &mut [u32],
+    ) -> Result<(), ArmError> {
+        if self.window.is_empty() {
+            return self
+                .interface
+                .access_raw_ap_registers(&self.ap, accesses, values);
+        }
+
+        let mut with_window = self.window.clone();
+        with_window.extend_from_slice(accesses);
+        self.interface
+            .access_raw_ap_registers(&self.ap, &with_window, values)?;
+        // Kept until then: after a failure, it is not known whether TAR was written.
+        self.window.clear();
+        Ok(())
+    }
+
     #[expect(dead_code)]
     fn set_dtrrx(&mut self, value: u32) -> Result<(), ArmError> {
-        self.interface
-            .write_raw_ap_register(&self.ap, self.dtrrx, value)
+        self.access(&[(self.dtrrx, Some(value))], &mut [])
     }
 
     fn dscr(&mut self) -> Result<Dbgdscr, ArmError> {
-        self.interface
-            .read_raw_ap_register(&self.ap, self.dscr)
-            .map(Dbgdscr::from)
+        let mut dscr = [0];
+        self.access(&[(self.dscr, None)], &mut dscr)?;
+        Ok(Dbgdscr(dscr[0]))
     }
 
     fn set_dscr(&mut self, value: Dbgdscr) -> Result<(), ArmError> {
-        self.interface
-            .write_raw_ap_register(&self.ap, self.dscr, value.into())
+        self.access(&[(self.dscr, Some(value.into()))], &mut [])
     }
 
     /// Leave DCC Fast mode, then return DBGDSCR, one access at a time.
@@ -136,11 +159,7 @@ impl<'a> BankedAccess<'a> {
         accesses.extend(std::iter::repeat_n((self.dtrtx, None), count));
         accesses.push((self.dscr, None));
         let mut streamed = vec![0; count + 1];
-        if self
-            .interface
-            .access_raw_ap_registers(&self.ap, &accesses, &mut streamed)
-            .is_err()
-        {
+        if self.access(&accesses, &mut streamed).is_err() {
             return self.leave_fast_mode();
         }
         // The first word read was left over from before the first load.
@@ -153,10 +172,7 @@ impl<'a> BankedAccess<'a> {
             (self.dtrtx, None),
             (self.dscr, None),
         ];
-        match self
-            .interface
-            .access_raw_ap_registers(&self.ap, &leave, &mut tail)
-        {
+        match self.access(&leave, &mut tail) {
             Ok(()) => {
                 data[count - 1] = tail[0];
                 Ok(Dbgdscr(tail[1]))
@@ -181,11 +197,7 @@ impl<'a> BankedAccess<'a> {
         accesses.extend(data.iter().map(|&word| (self.dtrrx, Some(word))));
         accesses.push((self.dscr, None));
         let mut dscr = [0];
-        if self
-            .interface
-            .access_raw_ap_registers(&self.ap, &accesses, &mut dscr)
-            .is_err()
-        {
+        if self.access(&accesses, &mut dscr).is_err() {
             return self.leave_fast_mode();
         }
         let non_blocking = self.exit_value(Dbgdscr(dscr[0]))?;
@@ -194,10 +206,7 @@ impl<'a> BankedAccess<'a> {
             (self.dscr, Some(u32::from(non_blocking))),
             (self.dscr, None),
         ];
-        match self
-            .interface
-            .access_raw_ap_registers(&self.ap, &leave, &mut dscr)
-        {
+        match self.access(&leave, &mut dscr) {
             Ok(()) => Ok(Dbgdscr(dscr[0])),
             Err(_) => self.leave_fast_mode(),
         }
@@ -616,16 +625,19 @@ impl<'probe> Armv7ar<'probe> {
     /// For greater performance, place DBGDTRTX, DBGDTRRX, DBGITR, and DBGDCSR
     /// into the banked register window. This will allow us to directly access
     /// these four values.
+    ///
+    /// The TAR writes that set up the window go out with the first access through it.
     fn banked_access(&mut self) -> Result<BankedAccess<'_>, Error> {
         let address = Dbgdtrrx::get_mmio_address_from_base(self.base_address)?;
         let ap = self.memory.fully_qualified_address();
         let is_64_bit = self.is_64_bit();
         let interface = self.memory.get_arm_debug_interface()?;
 
+        let mut window = Vec::new();
         if is_64_bit {
-            interface.write_raw_ap_register(&ap, TAR2::ADDRESS, (address >> 32) as u32)?;
+            window.push((TAR2::ADDRESS, Some((address >> 32) as u32)));
         }
-        interface.write_raw_ap_register(&ap, TAR::ADDRESS, address as u32)?;
+        window.push((TAR::ADDRESS, Some(address as u32)));
 
         Ok(BankedAccess {
             interface,
@@ -634,6 +646,7 @@ impl<'probe> Armv7ar<'probe> {
             itr: BD1::ADDRESS,
             dscr: BD2::ADDRESS,
             dtrtx: BD3::ADDRESS,
+            window,
         })
     }
 }

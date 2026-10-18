@@ -259,8 +259,8 @@ pub trait DapAccess {
     ///
     /// An entry carrying a value is written; an entry without one is read, and each read writes one
     /// word to `values` in the order the reads appear. `values` has to be long enough for every
-    /// read, since a short one panics rather than reporting. Every address has to be in the same
-    /// register bank, because the bank is selected once for the whole sequence.
+    /// read, since a short one panics rather than reporting. The addresses may be in different
+    /// register banks; the bank is switched in between where needed.
     ///
     /// This is for callers holding a list of addresses whose accesses depend on each other, where
     /// the alternative is one probe round trip per address. The default performs them one at a

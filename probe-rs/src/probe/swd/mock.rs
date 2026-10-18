@@ -66,6 +66,8 @@ pub(crate) struct MockSwdProbe {
     handles_ap_pipeline: bool,
     capture_flags: Arc<Mutex<Vec<bool>>>,
     idles: Arc<Mutex<Vec<u32>>>,
+    batches: Arc<Mutex<Vec<usize>>>,
+    fault: Arc<Mutex<Option<(Port, u8, Direction)>>>,
     pins: Arc<Mutex<Vec<RecordedPins>>>,
     pin_levels: Option<u8>,
     swd_settings: SwdSettings,
@@ -85,6 +87,8 @@ impl MockSwdProbe {
             handles_ap_pipeline: false,
             capture_flags: Arc::new(Mutex::new(Vec::new())),
             idles: Arc::new(Mutex::new(Vec::new())),
+            batches: Arc::new(Mutex::new(Vec::new())),
+            fault: Arc::new(Mutex::new(None)),
             pins: Arc::new(Mutex::new(Vec::new())),
             pin_levels: None,
             swd_settings: SwdSettings::default(),
@@ -100,6 +104,16 @@ impl MockSwdProbe {
     /// Return a handle to the recorded operations.
     pub(crate) fn shared_operations(&self) -> Arc<Mutex<Vec<RecordedOp>>> {
         self.operations.clone()
+    }
+
+    /// Return a handle to the number of transfers in each executed batch.
+    pub(crate) fn shared_batches(&self) -> Arc<Mutex<Vec<usize>>> {
+        self.batches.clone()
+    }
+
+    /// Return a handle that makes the next transfer to one register, in one direction, FAULT.
+    pub(crate) fn shared_fault(&self) -> Arc<Mutex<Option<(Port, u8, Direction)>>> {
+        self.fault.clone()
     }
 
     /// Return a handle to the recorded pins operations.
@@ -171,6 +185,13 @@ impl MockSwdProbe {
     }
 
     fn next_response(&mut self, port: Port, addr: u8, direction: Direction) -> ScriptedResponse {
+        let mut fault = self.fault.lock().unwrap();
+        if *fault == Some((port, addr, direction)) {
+            *fault = None;
+            return ScriptedResponse::Fault;
+        }
+        drop(fault);
+
         if direction == Direction::Read {
             self.scripted_read(port, addr)
         } else if let Some(response) = self.responses.get(self.response_index) {
@@ -253,6 +274,11 @@ impl SwdProbe for MockSwdProbe {
         batch: &SwdBatch,
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
         let mut results = Results::new();
+        let transfers = batch
+            .iter()
+            .filter(|(_, op)| matches!(op, SwdOp::Transfer { .. }))
+            .count();
+        self.batches.lock().unwrap().push(transfers);
 
         for (fault_operation, (id, op)) in batch.iter().enumerate() {
             match op {

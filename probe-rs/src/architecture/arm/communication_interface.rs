@@ -5,8 +5,8 @@ use crate::{
         SwoConfig,
         ap::{self, AccessPortType},
         dp::{
-            Ctrl, DPIDR, DebugPortId, DebugPortVersion, DpAccess, DpAddress, DpRegisterAddress,
-            Select1, SelectV1, SelectV3,
+            Ctrl, DPIDR, DebugPortId, DebugPortVersion, DpAccess, DpAddress, DpRegister,
+            DpRegisterAddress, Select1, SelectV1, SelectV3,
         },
         memory::{ADIMemoryInterface, ArmMemoryInterface, Component},
         sequences::ArmDebugSequence,
@@ -1104,6 +1104,21 @@ impl ArmCommunicationInterface {
         ap: &FullyQualifiedApAddress,
         ap_register_address: u64,
     ) -> Result<(), ArmError> {
+        if let Some(select) = self.update_select(ap, ap_register_address)? {
+            self.write_select(ap.dp(), select)?;
+        }
+        Ok(())
+    }
+
+    /// Point SELECT at the bank of `ap_register_address` in the cache, and return the value that
+    /// still has to be written for the DP to agree, if the selection changed.
+    ///
+    /// Whoever writes it marks the cache invalid when the write fails.
+    fn update_select(
+        &mut self,
+        ap: &FullyQualifiedApAddress,
+        ap_register_address: u64,
+    ) -> Result<Option<SelectCache>, ArmError> {
         let dp_state = self.select_dp(ap.dp())?;
 
         let previous_select = dp_state.current_select;
@@ -1145,19 +1160,75 @@ impl ArmCommunicationInterface {
 
         if !was_valid || previous_select != dp_state.current_select {
             tracing::debug!("Changing SELECT to {:x?}", dp_state.current_select);
-
-            match dp_state.current_select {
-                SelectCache::DPv1(select) => {
-                    self.write_dp_register(ap.dp(), select)?;
-                }
-                SelectCache::DPv3(select, select1) => {
-                    self.write_dp_register(ap.dp(), select)?;
-                    self.write_dp_register(ap.dp(), select1)?;
-                }
-            }
+            return Ok(Some(dp_state.current_select));
         }
 
-        Ok(())
+        Ok(None)
+    }
+
+    /// Write SELECT, and on DPv3 SELECT1, by themselves.
+    fn write_select(&mut self, dp: DpAddress, select: SelectCache) -> Result<(), ArmError> {
+        match select {
+            SelectCache::DPv1(select) => self.write_dp_register(dp, select),
+            SelectCache::DPv3(select, select1) => {
+                self.write_dp_register(dp, select)?;
+                self.write_dp_register(dp, select1)
+            }
+        }
+    }
+
+    /// Bring SELECT to the bank of `ap_register_address`, with the write scheduled into `batch`
+    /// ahead of the accesses that follow it, so that a bank switch costs no transaction of its
+    /// own. Returns whether a write was scheduled, for [`Self::with_swd_port_select`].
+    ///
+    /// Only a DPv1 SELECT is scheduled. On DPv3, SELECT1 sits in a DP bank of its own, which
+    /// takes writes to SELECT around it, so both are written straight away as before; `batch`
+    /// must then hold no accesses yet, or the write would overtake them.
+    fn schedule_select(
+        &mut self,
+        ap: &FullyQualifiedApAddress,
+        ap_register_address: u64,
+        batch: &mut SwdBatch,
+    ) -> Result<bool, ArmError> {
+        match self.update_select(ap, ap_register_address)? {
+            None => Ok(false),
+            Some(SelectCache::DPv1(select)) => {
+                let addr = Self::swd_addr(RegisterAddress::DpRegister(
+                    <SelectV1 as DpRegister>::ADDRESS,
+                ));
+                batch.write(Port::Dp, addr, select.into());
+                Ok(true)
+            }
+            Some(select) => {
+                self.write_select(ap.dp(), select)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Whether SELECT writes can go in the same batch as the accesses. See
+    /// [`Self::schedule_select`].
+    fn schedules_select(&mut self, dp: DpAddress) -> Result<bool, ArmError> {
+        Ok(matches!(
+            self.select_dp(dp)?.current_select,
+            SelectCache::DPv1(_)
+        ))
+    }
+
+    /// Run `f` on the probe's transfers, for a batch that carries a SELECT write if
+    /// `select_scheduled`. The cached SELECT is trusted again once that batch has gone
+    /// through; if it fails, whether the write reached the DP is unknown, so it is not.
+    fn with_swd_port_select<R>(
+        &mut self,
+        dp: DpAddress,
+        select_scheduled: bool,
+        f: impl FnOnce(&mut SwdPort<'_>) -> Result<R, SwdPortError>,
+    ) -> Result<R, ArmError> {
+        let result = self.with_swd_port(f);
+        if select_scheduled && let Some(state) = self.dps.get_mut(&dp) {
+            state.select_valid = result.is_ok();
+        }
+        result
     }
 }
 
@@ -1202,6 +1273,11 @@ impl SwoAccess for ArmCommunicationInterface {
 /// transfers -- so a run must not span a change of register or of direction.
 fn same_run(a: &(u64, Option<u32>), b: &(u64, Option<u32>)) -> bool {
     a.0 == b.0 && a.1.is_some() == b.1.is_some()
+}
+
+/// Whether two accesses are in the same AP register bank, which one SELECT reaches.
+fn same_bank(a: &(u64, Option<u32>), b: &(u64, Option<u32>)) -> bool {
+    a.0 >> 4 == b.0 >> 4
 }
 
 impl DapAccess for ArmCommunicationInterface {
@@ -1258,18 +1334,19 @@ impl DapAccess for ArmCommunicationInterface {
         address: u64,
     ) -> Result<u32, ArmError> {
         self.retry_after_link_loss(ap.dp(), |this| {
-            this.select_ap_and_ap_bank(ap, address)?;
             let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
             if this.uses_transfer_port() {
                 let addr = Self::ap_swd_addr(address);
-                this.with_swd_port(|port| {
-                    let mut batch = SwdBatch::new();
+                let mut batch = SwdBatch::new();
+                let select = this.schedule_select(ap, address, &mut batch)?;
+                this.with_swd_port_select(ap.dp(), select, |port| {
                     let handle = port.read_ap_block(&mut batch, addr, 1);
                     let mut results = port.run(batch)?;
                     Ok(results.take(handle).unwrap()[0])
                 })
             } else {
+                this.select_ap_and_ap_bank(ap, address)?;
                 this.with_jtag_chain(|chain, settings| {
                     jtag_read_register(chain, register, settings)
                 })
@@ -1283,14 +1360,14 @@ impl DapAccess for ArmCommunicationInterface {
         address: u64,
         values: &mut [u32],
     ) -> Result<(), ArmError> {
-        self.select_ap_and_ap_bank(ap, address)?;
         let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
         if self.uses_transfer_port() {
             let addr = Self::ap_swd_addr(address);
             let count = values.len();
-            self.with_swd_port(|port| {
-                let mut batch = SwdBatch::new();
+            let mut batch = SwdBatch::new();
+            let select = self.schedule_select(ap, address, &mut batch)?;
+            self.with_swd_port_select(ap.dp(), select, |port| {
                 let handle = port.read_ap_block(&mut batch, addr, count);
                 let mut results = port.run(batch)?;
                 let read_values = results.take(handle).unwrap();
@@ -1298,6 +1375,7 @@ impl DapAccess for ArmCommunicationInterface {
                 Ok(())
             })
         } else {
+            self.select_ap_and_ap_bank(ap, address)?;
             self.with_jtag_chain(|chain, settings| {
                 jtag_read_block(chain, register, values, settings)
             })
@@ -1310,18 +1388,9 @@ impl DapAccess for ArmCommunicationInterface {
         accesses: &[(u64, Option<u32>)],
         values: &mut [u32],
     ) -> Result<(), ArmError> {
-        let Some(&(first, _)) = accesses.first() else {
+        if accesses.is_empty() {
             return Ok(());
-        };
-
-        // The bank is selected once, from the first address, so an access from another bank would
-        // reach a different register and report success. Checked in release builds too.
-        assert!(
-            accesses
-                .iter()
-                .all(|&(address, _)| address >> 4 == first >> 4),
-            "every access has to be in the same AP register bank"
-        );
+        }
         debug_assert!(
             values.len() >= accesses.iter().filter(|(_, value)| value.is_none()).count(),
             "every read needs a word to land in"
@@ -1362,19 +1431,33 @@ impl DapAccess for ArmCommunicationInterface {
         if accesses.iter().any(|(_, value)| value.is_some()) {
             self.forget_memory_ap(ap);
         }
-        self.select_ap_and_ap_bank(ap, first)?;
+        let banks = accesses.chunk_by(same_bank);
+        if banks.clone().count() > 1 && !self.schedules_select(ap.dp())? {
+            // Each bank's SELECT is written by itself, so each bank goes in a batch of its own.
+            let mut read = 0;
+            for bank in banks {
+                let reads = bank.iter().filter(|(_, value)| value.is_none()).count();
+                self.access_raw_ap_registers(ap, bank, &mut values[read..read + reads])?;
+                read += reads;
+            }
+            return Ok(());
+        }
 
-        self.with_swd_port(|port| {
-            let mut batch = SwdBatch::new();
-            let mut handles = Vec::new();
-            for &(address, value) in accesses {
+        let mut batch = SwdBatch::new();
+        let mut handles = Vec::new();
+        let mut select = false;
+        for bank in banks {
+            select |= self.schedule_select(ap, bank[0].0, &mut batch)?;
+            for &(address, value) in bank {
                 let addr = Self::ap_swd_addr(address);
                 match value {
                     Some(value) => batch.write(Port::Ap, addr, value),
                     None => handles.push(batch.read(Port::Ap, addr)),
                 }
             }
+        }
 
+        self.with_swd_port_select(ap.dp(), select, |port| {
             let mut results = port.run(batch)?;
             for (read, handle) in handles.into_iter().enumerate() {
                 values[read] = results.take(handle).unwrap();
@@ -1391,18 +1474,19 @@ impl DapAccess for ArmCommunicationInterface {
     ) -> Result<(), ArmError> {
         self.forget_memory_ap(ap);
         self.retry_after_link_loss(ap.dp(), |this| {
-            this.select_ap_and_ap_bank(ap, address)?;
             let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
             if this.uses_transfer_port() {
                 let addr = Self::ap_swd_addr(address);
-                this.with_swd_port(|port| {
-                    let mut batch = SwdBatch::new();
+                let mut batch = SwdBatch::new();
+                let select = this.schedule_select(ap, address, &mut batch)?;
+                this.with_swd_port_select(ap.dp(), select, |port| {
                     batch.write(Port::Ap, addr, value);
                     port.run(batch)?;
                     Ok(())
                 })
             } else {
+                this.select_ap_and_ap_bank(ap, address)?;
                 this.with_jtag_chain(|chain, settings| {
                     jtag_write_register(chain, register, value, settings)
                 })
@@ -1417,18 +1501,19 @@ impl DapAccess for ArmCommunicationInterface {
         values: &[u32],
     ) -> Result<(), ArmError> {
         self.forget_memory_ap(ap);
-        self.select_ap_and_ap_bank(ap, address)?;
         let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
         if self.uses_transfer_port() {
             let addr = Self::ap_swd_addr(address);
-            self.with_swd_port(|port| {
-                let mut batch = SwdBatch::new();
+            let mut batch = SwdBatch::new();
+            let select = self.schedule_select(ap, address, &mut batch)?;
+            self.with_swd_port_select(ap.dp(), select, |port| {
                 port.write_ap_block(&mut batch, addr, values);
                 port.run(batch)?;
                 Ok(())
             })
         } else {
+            self.select_ap_and_ap_bank(ap, address)?;
             self.with_jtag_chain(|chain, settings| {
                 jtag_write_block(chain, register, values, settings)
             })
@@ -1727,6 +1812,96 @@ mod tests {
             read_ops(&ops),
             vec![(Port::Ap, 0b1100), (Port::Dp, DP_RDBUFF_ADDR)]
         );
+    }
+
+    /// A bank switch is a DP write in the same batch as the AP access, not a round trip of its
+    /// own.
+    #[test]
+    fn swd_ap_bank_switch_goes_in_the_access_batch() {
+        let mut probe = MockSwdProbe::new();
+        prepare_swd_probe(&mut probe);
+        let batches = probe.shared_batches();
+        let (mut interface, operations) = swd_interface(probe);
+        finish_attach(&mut interface, &operations);
+        batches.lock().unwrap().clear();
+
+        let ap = FullyQualifiedApAddress::v1_with_default_dp(0);
+        interface
+            .read_raw_ap_register(&ap, 0x18)
+            .expect("read should succeed");
+
+        let ops = operations.lock().unwrap();
+        assert_eq!(write_ops(&ops), vec![(Port::Dp, DP_SELECT_ADDR, 0x10)]);
+        assert_eq!(
+            read_ops(&ops),
+            vec![(Port::Ap, 0b1000), (Port::Dp, DP_RDBUFF_ADDR)]
+        );
+        assert_eq!(*batches.lock().unwrap(), [3]);
+    }
+
+    /// Batched accesses may cross banks; each switch is written between them, in the same
+    /// batch.
+    #[test]
+    fn swd_batched_ap_accesses_switch_banks_in_the_batch() {
+        let mut probe = MockSwdProbe::new();
+        prepare_swd_probe(&mut probe);
+        probe.set_read_value(Port::Dp, DP_RDBUFF_ADDR, 7);
+        let batches = probe.shared_batches();
+        let (mut interface, operations) = swd_interface(probe);
+        finish_attach(&mut interface, &operations);
+        let ap = FullyQualifiedApAddress::v1_with_default_dp(0);
+        interface.read_raw_ap_register(&ap, 0x00).unwrap();
+        operations.lock().unwrap().clear();
+        batches.lock().unwrap().clear();
+
+        let mut values = [0; 2];
+        interface
+            .access_raw_ap_registers(
+                &ap,
+                &[(0x04, Some(0x8000_1080)), (0x18, None), (0x0C, None)],
+                &mut values,
+            )
+            .expect("accesses should succeed");
+
+        let ops = operations.lock().unwrap();
+        assert_eq!(
+            write_ops(&ops),
+            vec![
+                (Port::Ap, 0b0100, 0x8000_1080),
+                (Port::Dp, DP_SELECT_ADDR, 0x10),
+                (Port::Dp, DP_SELECT_ADDR, 0x00),
+            ]
+        );
+        assert_eq!(batches.lock().unwrap().len(), 1);
+        assert_eq!(values, [7, 7]);
+    }
+
+    /// If the batch carrying a bank switch fails, the switch may not have happened, so the next
+    /// access to that bank writes SELECT again.
+    #[test]
+    fn swd_failed_bank_switch_is_written_again() {
+        let mut probe = MockSwdProbe::new();
+        prepare_swd_probe(&mut probe);
+        let fault = probe.shared_fault();
+        let (mut interface, operations) = swd_interface(probe);
+        finish_attach(&mut interface, &operations);
+        let ap = FullyQualifiedApAddress::v1_with_default_dp(0);
+
+        *fault.lock().unwrap() = Some((Port::Ap, 0b1000, Direction::Read));
+        interface
+            .access_raw_ap_registers(&ap, &[(0x18, None)], &mut [0])
+            .expect_err("the access should fault");
+
+        let mut select_written = || {
+            operations.lock().unwrap().clear();
+            interface
+                .read_raw_ap_register(&ap, 0x18)
+                .expect("read should succeed");
+            write_ops(&operations.lock().unwrap()).contains(&(Port::Dp, DP_SELECT_ADDR, 0x10))
+        };
+        assert!(select_written());
+        // Once it has gone through, it is not written again.
+        assert!(!select_written());
     }
 
     #[test]
