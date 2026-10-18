@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::{
     architecture::arm::{
         RegisterAddress,
-        dp::{Abort, DpRegisterAddress},
+        dp::{Abort, Ctrl, DpRegister, DpRegisterAddress},
     },
     probe::{
         BatchError, BatchExecutionError, BitSequence, CommandResult, DebugProbeError, HandleId,
@@ -84,6 +84,28 @@ pub(crate) fn run_length(ops: &[(HandleId, SwdOp)], start: usize) -> usize {
         .count()
 }
 
+/// Over JTAG, the span of a batch that a sticky-error check has to cover: the index of the first
+/// AP transfer, which is blamed if an error is found, and of the last transfer, after which
+/// CTRL/STAT is read. None when there is nothing to check.
+///
+/// A JTAG-DP acknowledges OK and FAULT with one value, and `DAP_Transfer` passes it on as OK: the
+/// CMSIS-DAP specification defines ACK 1 as "OK (for SWD protocol), OK or FAULT (for JTAG
+/// protocol)". So an AP transfer the DP refused looks like one that went through, and leaves
+/// CTRL/STAT.STICKYERR set, after which the DP refuses every AP access. The only way to notice
+/// is to read CTRL/STAT afterwards, as the raw JTAG path does after each of its transfer sets.
+///
+/// Only an AP transfer sets the flag, so a batch without one is not checked. Nor is a batch whose
+/// last transfer writes ABORT: that clears the flags, so a read after it would say nothing.
+fn transfers_to_check(ops: &[(HandleId, SwdOp)]) -> Option<(usize, usize)> {
+    let first_ap = ops
+        .iter()
+        .position(|(_, op)| matches!(op, SwdOp::Transfer { port: Port::Ap, .. }))?;
+    let last = ops
+        .iter()
+        .rposition(|(_, op)| matches!(op, SwdOp::Transfer { .. }))?;
+    (!is_abort(&ops[last].1)).then_some((first_ap, last))
+}
+
 /// Split a run of transfers into the packets that carry them.
 ///
 /// Each packet arrives with its request built and its transfers carrying the batch index a fault
@@ -152,10 +174,14 @@ struct PendingTransfer {
 ///
 /// The two halves stay in step: entry `n` of `transfers` describes transfer `n` of `request`, which
 /// is what lets a reply be matched to the batch operation that asked for it. Only
-/// [`Self::push_all`] adds to either.
+/// [`Self::push_all`] adds to either, except for the CTRL/STAT read that [`Self::check_status`]
+/// puts last in `request`, which answers to no batch operation.
 struct PendingBatch {
     request: TransferRequest,
     transfers: Vec<PendingTransfer>,
+    /// Whether `request` ends in a read of CTRL/STAT that looks for a sticky error, and the batch
+    /// index to blame if it finds one.
+    status_check: Option<usize>,
 }
 
 impl PendingBatch {
@@ -165,11 +191,27 @@ impl PendingBatch {
         Self {
             request,
             transfers: Vec::new(),
+            status_check: None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.transfers.is_empty()
+        self.transfers.is_empty() && self.status_check.is_none()
+    }
+
+    /// End the packet with a read of CTRL/STAT, so that its reply tells whether a transfer was
+    /// refused -- see [`transfers_to_check`]. `blame` is the batch index a sticky error is
+    /// reported against. Returns whether the packet had room; an empty one always has.
+    fn check_status(&mut self, blame: usize, packet_size: u16) -> bool {
+        if self.status_check.is_some() {
+            return true;
+        }
+        if !self.is_empty() && !self.request.has_room_for(RW::R, packet_size) {
+            return false;
+        }
+        self.request.add_read(Ctrl::ADDRESS.into());
+        self.status_check = Some(blame);
+        true
     }
 
     /// Push every transfer `items` yields, or none of them when the packet runs out of room.
@@ -239,7 +281,10 @@ impl CmsisDap {
     /// Classify one `DAP_Transfer` reply.
     ///
     /// Pure, like [`Self::classify_block_response`], so recovery can wait until the reply has
-    /// been taken. Returns the batch index of the transfer the reply blames.
+    /// been taken. Returns the batch index of the transfer the reply blames. With a
+    /// `status_check`, the request ended in a CTRL/STAT read of its own, so the reply holds one
+    /// transfer more than `transfers`, and the check's index is blamed when there is no transfer
+    /// to blame.
     ///
     /// The acknowledgement is classified before the transfer count. A FAULT or WAIT stops the
     /// probe early, so a short count is the *consequence* of that error, not evidence that the
@@ -249,9 +294,13 @@ impl CmsisDap {
     fn classify_transfer_response(
         response: &TransferResponse,
         transfers: &[PendingTransfer],
+        status_check: Option<usize>,
     ) -> Result<(), (BatchError<DebugProbeError>, usize)> {
         let count = response.transfers.len();
-        let fault_operation = transfers[count.min(transfers.len()).saturating_sub(1)].batch_index;
+        let expected = transfers.len() + usize::from(status_check.is_some());
+        let fault_operation = transfers
+            .get(count.min(transfers.len()).saturating_sub(1))
+            .map_or(status_check.unwrap_or(0), |transfer| transfer.batch_index);
 
         if response.last_transfer_response.protocol_error {
             return Err((
@@ -273,12 +322,10 @@ impl CmsisDap {
         }
 
         // An OK acknowledgement with a short count really is the probe not saying why.
-        if count < transfers.len() {
+        if count < expected {
             return Err((
                 BatchError::Probe(DebugProbeError::Other(format!(
-                    "Possible error in CMSIS-DAP probe: Only {}/{} transfers were executed, but no error was reported.",
-                    count,
-                    transfers.len()
+                    "Possible error in CMSIS-DAP probe: Only {count}/{expected} transfers were executed, but no error was reported.",
                 ))),
                 fault_operation,
             ));
@@ -310,7 +357,7 @@ impl CmsisDap {
         };
 
         if let Err((error, fault_operation)) =
-            Self::classify_transfer_response(&response, transfers)
+            Self::classify_transfer_response(&response, transfers, pending.status_check)
         {
             self.recover_from_block_error(&error);
             return Err(BatchExecutionError {
@@ -318,6 +365,34 @@ impl CmsisDap {
                 results,
                 fault_operation,
             });
+        }
+
+        if let Some(blame) = pending.status_check {
+            let Some(ctrl) = response.transfers.last().and_then(|transfer| transfer.data) else {
+                return Err(BatchExecutionError::new_from_debug_probe_at(
+                    DebugProbeError::Other(
+                        "CMSIS-DAP read of CTRL/STAT did not return any data".to_string(),
+                    ),
+                    results,
+                    blame,
+                ));
+            };
+            if Ctrl(ctrl).sticky_err() {
+                // An AP transfer was refused: one of this batch, or of an earlier one if nothing
+                // has read CTRL/STAT since. Which one is unknown, and the DP has discarded every
+                // AP access since, so none of the results stands.
+                tracing::debug!(
+                    "CTRL/STAT reports a sticky error after a JTAG batch: {ctrl:#010x}"
+                );
+                self.clear_sticky_err();
+                return Err(BatchExecutionError {
+                    error: BatchError::Specific(DebugProbeError::SwdTransfer(
+                        SwdTransferError::FaultResponse,
+                    )),
+                    results: Results::new(),
+                    fault_operation: blame,
+                });
+            }
         }
 
         for (transfer, response_transfer) in transfers.iter().zip(response.transfers.iter()) {
@@ -382,6 +457,16 @@ impl CmsisDap {
         }
 
         Ok(())
+    }
+
+    /// Clear CTRL/STAT.STICKYERR, which a status check found set. Until it is cleared the DP
+    /// refuses every AP access.
+    fn clear_sticky_err(&mut self) {
+        let mut abort = Abort(0);
+        abort.set_stkerrclr(true);
+        if let Err(error) = self.write_abort(abort) {
+            tracing::warn!("Failed to clear the sticky error: {error}");
+        }
     }
 
     /// Put the port back in order after a block transfer failed.
@@ -604,6 +689,10 @@ impl SwdProbe for CmsisDap {
                 error, results, 0,
             ));
         }
+        // Nor does it report a FAULT, so CTRL/STAT is read once the transfers are done: in the
+        // packet that carries the last of them when it has room, else in one of its own.
+        let status_check = if jtag { transfers_to_check(&ops) } else { None };
+        let mut checked = false;
 
         let mut batch_index = 0;
         while batch_index < ops.len() {
@@ -614,8 +703,13 @@ impl SwdProbe for CmsisDap {
                 self.packet_size,
                 jtag,
             );
-            for packet in packets {
+            for mut packet in packets {
                 let packed = packet.transfers.len();
+                if let Some((blame, last)) = status_check
+                    && batch_index + packed > last
+                {
+                    checked = packet.check_status(blame, self.packet_size);
+                }
                 results = self.flush_pending_transfers(&packet, results)?;
                 batch_index += packed;
             }
@@ -684,6 +778,15 @@ impl SwdProbe for CmsisDap {
             batch_index += 1;
         }
 
+        if let Some((blame, _)) = status_check
+            && !checked
+        {
+            // The last transfer went as a block, or its packet had no room left.
+            let mut packet = PendingBatch::new(dap_index);
+            packet.check_status(blame, self.packet_size);
+            results = self.flush_pending_transfers(&packet, results)?;
+        }
+
         Ok(results)
     }
 
@@ -705,8 +808,17 @@ impl SwdProbe for CmsisDap {
 mod tests {
     use super::*;
     use crate::probe::{
-        cmsisdap::commands::{Request, transfer::LastTransferResponse},
+        cmsisdap::commands::{
+            CmsisDapDevice, Request,
+            fake::{FakeProbe, Reply, standard_reply},
+            transfer::LastTransferResponse,
+        },
+        jtag::TapState,
         swd::{Direction, Port, SwdOp},
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     };
 
     fn block_response(count: u16, ack: Ack) -> TransferBlockResponse {
@@ -1120,7 +1232,7 @@ mod tests {
         let response = transfer_response(2, Ack::Fault);
 
         let (error, fault_operation) =
-            CmsisDap::classify_transfer_response(&response, &transfers).unwrap_err();
+            CmsisDap::classify_transfer_response(&response, &transfers, None).unwrap_err();
 
         assert!(
             matches!(
@@ -1139,7 +1251,8 @@ mod tests {
         let transfers = pending_transfers(4);
         let response = transfer_response(1, Ack::Wait);
 
-        let (error, _) = CmsisDap::classify_transfer_response(&response, &transfers).unwrap_err();
+        let (error, _) =
+            CmsisDap::classify_transfer_response(&response, &transfers, None).unwrap_err();
 
         assert!(
             matches!(
@@ -1156,7 +1269,7 @@ mod tests {
         let response = transfer_response(3, Ack::Ok);
 
         let (error, fault_operation) =
-            CmsisDap::classify_transfer_response(&response, &transfers).unwrap_err();
+            CmsisDap::classify_transfer_response(&response, &transfers, None).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1170,6 +1283,201 @@ mod tests {
         let transfers = pending_transfers(4);
         let response = transfer_response(4, Ack::Ok);
 
-        assert!(CmsisDap::classify_transfer_response(&response, &transfers).is_ok());
+        assert!(CmsisDap::classify_transfer_response(&response, &transfers, None).is_ok());
+    }
+
+    const STICKYERR: u32 = 1 << 5;
+    /// The request byte of a `DAP_Transfer` read of CTRL/STAT: DP, read, A[3:2] = 0b01.
+    const READ_CTRL_STAT: u8 = 0b0110;
+    /// The request byte of a `DAP_Transfer` write of AP register 0x4.
+    const WRITE_AP_4: u8 = 0b0101;
+
+    /// A CMSIS-DAP probe in JTAG mode with its scan chain configured, whose DP answers reads of
+    /// CTRL/STAT with `ctrl` and every other read with the transfer's index in its command.
+    /// `DAP_WriteABORT` clears STICKYERR in `ctrl`.
+    fn jtag_dap(ctrl: &Arc<AtomicU32>) -> (CmsisDap, Arc<Mutex<FakeProbe>>) {
+        let probe = FakeProbe::shared(64, {
+            let ctrl = ctrl.clone();
+            move |command| match command {
+                [0x05, _, count, requests @ ..] => {
+                    let mut reply = vec![0x05, *count, Ack::Ok as u8];
+                    let mut offset = 0;
+                    for index in 0..*count {
+                        let request = requests[offset];
+                        if request & 0b10 == 0 {
+                            offset += 5;
+                            continue;
+                        }
+                        let word = if request & 0b1101 == READ_CTRL_STAT & 0b1101 {
+                            ctrl.load(Ordering::Relaxed)
+                        } else {
+                            u32::from(index)
+                        };
+                        reply.extend(word.to_le_bytes());
+                        offset += 1;
+                    }
+                    Reply::Now(reply)
+                }
+                [0x06, _, lo, hi, request, ..] => {
+                    let mut reply = vec![0x06, *lo, *hi, Ack::Ok as u8];
+                    if request & 0b10 != 0 {
+                        for index in 0..u32::from(u16::from_le_bytes([*lo, *hi])) {
+                            reply.extend(index.to_le_bytes());
+                        }
+                    }
+                    Reply::Now(reply)
+                }
+                [0x08, ..] => {
+                    ctrl.fetch_and(!STICKYERR, Ordering::Relaxed);
+                    Reply::Now(vec![0x08, 0x00])
+                }
+                _ => standard_reply(command, 64, 4),
+            }
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        dap.protocol = Some(WireProtocol::Jtag);
+        dap.connected = true;
+        dap.jtag_configured = true;
+        dap.jtag_state.tap_state = TapState::RunTestIdle;
+        probe.lock().unwrap().sent.clear();
+        (dap, probe)
+    }
+
+    /// The `DAP_Transfer`, `DAP_TransferBlock` and `DAP_WriteABORT` commands the probe was sent.
+    fn dap_commands(probe: &Arc<Mutex<FakeProbe>>) -> Vec<Vec<u8>> {
+        probe
+            .lock()
+            .unwrap()
+            .sent
+            .iter()
+            .filter(|command| matches!(command[0], 0x05 | 0x06 | 0x08))
+            .cloned()
+            .collect()
+    }
+
+    /// Over JTAG the probe acknowledges a refused AP transfer as OK, so the batch reads CTRL/STAT
+    /// in its last packet, and a sticky error there fails the whole batch and is cleared.
+    #[test]
+    fn over_jtag_a_sticky_error_fails_the_batch_and_is_cleared() {
+        let ctrl = Arc::new(AtomicU32::new(STICKYERR));
+        let (mut dap, probe) = jtag_dap(&ctrl);
+        let mut batch = SwdBatch::new();
+        batch.write(Port::Ap, 0b0100, 0x2000_0000);
+        let read = batch.read(Port::Ap, 0b1100);
+
+        let error = dap.run_batch(&batch).unwrap_err();
+
+        assert!(
+            matches!(
+                error.error,
+                BatchError::Specific(DebugProbeError::SwdTransfer(
+                    SwdTransferError::FaultResponse
+                ))
+            ),
+            "got {:?}",
+            error.error
+        );
+        assert_eq!(error.fault_operation, 0);
+        let mut results = error.results;
+        assert!(results.take(read).is_err());
+
+        let commands = dap_commands(&probe);
+        assert_eq!(commands.len(), 2, "{commands:x?}");
+        // The write, the read and the CTRL/STAT read travel in one packet.
+        assert_eq!(commands[0][2], 3);
+        assert_eq!(commands[0].last(), Some(&READ_CTRL_STAT));
+        // STKERRCLR goes through DAP_WriteABORT, which reaches ABORT over JTAG.
+        assert_eq!(commands[1], vec![0x08, 0x00, 0x04, 0x00, 0x00, 0x00]);
+        assert_eq!(ctrl.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn over_jtag_a_clear_ctrl_stat_leaves_the_results_alone() {
+        let (mut dap, probe) = jtag_dap(&Arc::new(AtomicU32::new(0)));
+        let mut batch = SwdBatch::new();
+        batch.write(Port::Ap, 0b0100, 0x2000_0000);
+        let read = batch.read(Port::Ap, 0b1100);
+
+        let mut results = dap.run_batch(&batch).unwrap();
+
+        // The read was the second transfer of its command.
+        assert_eq!(results.take(read).unwrap(), 1);
+        let commands = dap_commands(&probe);
+        assert_eq!(commands.len(), 1, "{commands:x?}");
+        assert_eq!(commands[0][2], 3);
+        assert_eq!(commands[0].last(), Some(&READ_CTRL_STAT));
+    }
+
+    #[test]
+    fn over_jtag_a_full_packet_is_followed_by_the_check_in_its_own() {
+        let (mut dap, probe) = jtag_dap(&Arc::new(AtomicU32::new(0)));
+        let mut batch = SwdBatch::new();
+        // Fifteen reads fill a 64-byte reply, so the check does not fit behind them.
+        let reads: Vec<_> = (0..15).map(|_| batch.read(Port::Ap, 0b1100)).collect();
+
+        let mut results = dap.run_batch(&batch).unwrap();
+
+        for (word, read) in reads.into_iter().enumerate() {
+            assert_eq!(results.take(read).unwrap(), word as u32);
+        }
+        let commands = dap_commands(&probe);
+        assert_eq!(commands.len(), 2, "{commands:x?}");
+        assert_eq!(commands[0][2], 15);
+        assert_eq!(commands[1], vec![0x05, 0x00, 0x01, READ_CTRL_STAT]);
+    }
+
+    #[test]
+    fn over_jtag_the_check_follows_a_block_transfer() {
+        let (mut dap, probe) = jtag_dap(&Arc::new(AtomicU32::new(0)));
+        let mut batch = SwdBatch::new();
+        let reads: Vec<_> = (0..40).map(|_| batch.read(Port::Ap, 0b1100)).collect();
+
+        let mut results = dap.run_batch(&batch).unwrap();
+
+        for read in reads {
+            assert!(results.take(read).is_ok());
+        }
+        let commands = dap_commands(&probe);
+        let blocks = commands.iter().filter(|command| command[0] == 0x06).count();
+        assert_eq!(blocks, 3, "{commands:x?}");
+        assert_eq!(commands.len(), blocks + 1);
+        assert_eq!(commands[blocks], vec![0x05, 0x00, 0x01, READ_CTRL_STAT]);
+    }
+
+    /// A batch without an AP transfer cannot set the flag, and after a write to ABORT the flags
+    /// are clear, so neither is checked. Over SWD the probe reports FAULT itself.
+    #[test]
+    fn only_a_jtag_batch_with_ap_transfers_is_checked() {
+        let ctrl = Arc::new(AtomicU32::new(STICKYERR));
+        let (mut dap, probe) = jtag_dap(&ctrl);
+
+        let mut batch = SwdBatch::new();
+        let read = batch.read(Port::Dp, 0b0100);
+        let mut results = dap.run_batch(&batch).unwrap();
+        assert_eq!(results.take(read).unwrap(), STICKYERR);
+
+        let mut batch = SwdBatch::new();
+        batch.write(Port::Ap, 0b0100, 0x2000_0000);
+        batch.write(Port::Dp, 0b0000, 0x1e);
+        dap.run_batch(&batch).unwrap();
+
+        dap.protocol = Some(WireProtocol::Swd);
+        ctrl.store(STICKYERR, Ordering::Relaxed);
+        let mut batch = SwdBatch::new();
+        batch.write(Port::Ap, 0b0100, 0x2000_0000);
+        let _ = batch.read(Port::Ap, 0b1100);
+        dap.run_batch(&batch).unwrap();
+
+        let commands = dap_commands(&probe);
+        assert_eq!(
+            commands,
+            vec![
+                vec![0x05, 0x00, 0x01, READ_CTRL_STAT],
+                vec![0x05, 0x00, 0x01, WRITE_AP_4, 0x00, 0x00, 0x00, 0x20],
+                vec![0x08, 0x00, 0x1e, 0x00, 0x00, 0x00],
+                vec![0x05, 0x00, 0x02, WRITE_AP_4, 0x00, 0x00, 0x00, 0x20, 0b1111],
+            ],
+            "{commands:x?}"
+        );
     }
 }
